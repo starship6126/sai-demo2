@@ -1,6 +1,8 @@
 import {Platform} from 'react-native';
 import * as SecureStore from 'expo-secure-store';
-import type {Profile, Match} from '../shared/matching';
+import type {Profile, Match, Interest} from '../shared/matching';
+
+export type EditableProfile = Profile & {version?: string};
 
 const API = (process.env.EXPO_PUBLIC_API_URL || (Platform.OS === 'web' ? '' : 'http://localhost:8788')).replace(/\/$/, '');
 const SESSION_KEY = 'sai-session';
@@ -15,6 +17,14 @@ export type SourceState = {
   counts: Record<string, number>;
   errors?: string[];
   channels?: {id: string; title: string; description: string; url: string}[];
+};
+
+export type LinkedInImportJob = {
+  jobId: string;
+  status: 'pending' | 'ready' | 'failed';
+  url: string;
+  candidates?: Interest[];
+  error?: string;
 };
 
 export type Assignment = {
@@ -43,7 +53,7 @@ export type RoomDetails = Omit<Room, 'count'> & {
 
 export type ServiceState = {
   account: {username: string; instagramHandle?: string; linkedinHandle?: string} | null;
-  me: Profile | null;
+  me: EditableProfile | null;
   rooms: Room[];
   friends: Profile[];
   requests: Profile[];

@@ -22,6 +22,7 @@ const env={DB,GEMINI_API_KEY:'fixture-key',fetch:async(url,options)=>{
  return [{mode:'cohesion',groups:[{ids,score:metrics.utility,metrics,interests:matches}],unassigned:[],score:Math.round(metrics.utility*100),minScore:Math.round(metrics.utility*100),range:0,algorithm:'fixture'}];
 }};
 async function call(body,token='',query='',environment=env){
+ if(body?.action==='saveProfile'&&body.version===undefined&&token)body={...body,version:(await call(undefined,token,'',environment)).data.me?.version??null};
  const response=await api(new Request('https://test.invalid/api/app'+query,{method:body?'POST':'GET',headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},...(body?{body:JSON.stringify(body)}:{})}),environment);
  return {status:response.status,data:await response.json()};
 }

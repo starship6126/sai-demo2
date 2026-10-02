@@ -26,6 +26,12 @@ const cleaned=await extractYouTubeInterests(sensitiveChannels,{GEMINI_API_KEY:'s
 }});
 assert.equal(sensitiveCalls,1);
 assert.deepEqual(cleaned.interests,[five[0]],'remaining sensitive results must not discard valid interests');
-const sensitiveOnly=await extractYouTubeInterests(sensitiveChannels,{GEMINI_API_KEY:'secret',fetch:async()=>output([{label:'contact@example.com',category:'기타',refs:[1]}])});
-assert.deepEqual(sensitiveOnly.interests,[],'sensitive-only output finishes without storing sensitive interests');
-console.log('PASS: Gemini input stays within 1000 characters, requests sensitive-data removal without stopping, retains valid interests, and rejects malformed or ungrounded output');
+await assert.rejects(extractYouTubeInterests(sensitiveChannels,{GEMINI_API_KEY:'secret',fetch:async()=>output([{label:'contact@example.com',category:'기타',refs:[1]}])}),error=>error.code==='EMPTY_RESULT');
+await assert.rejects(extractYouTubeInterests(channels,{GEMINI_API_KEY:'secret',fetch:async()=>output([])}),error=>error.code==='EMPTY_RESULT');
+assert.equal(YOUTUBE_INTEREST_SCHEMA.properties.interests.minItems,1);
+const single=await extractYouTubeInterests(channels.slice(0,1),{GEMINI_API_KEY:'secret',fetch:async(_url,init)=>{
+ const body=JSON.parse(init.body);assert.match(body.input,/채널 1개/);assert.match(body.input,/반드시/);assert(!body.input.includes('빈 배열'));assert(body.input.length<=1000);
+ return output([{label:'재즈 피아노 즉흥연주',category:'음악',refs:[1]}]);
+}});
+assert.equal(single.interests.length,1);
+console.log('PASS: Gemini requests at least one grounded keyword, accepts one selected channel, keeps input within 1000 characters, removes sensitive results, and rejects empty/malformed output');

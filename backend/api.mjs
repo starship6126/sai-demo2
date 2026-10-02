@@ -1,17 +1,23 @@
 import {validateAvatar} from './avatar.mjs';
+import {createHash} from 'node:crypto';
 import {ensureDefaultDemoData,isDemoProfile,isDemoRoom} from './default-demo.mjs';
 import {conversationTopics,optimizeConversationGroups,currentBridgeTopics,validatePlanBridgeTopics,withDeadline} from './conversation-topics.mjs';
 import {accountAction} from './auth.mjs';
 import {previewLinkedInText,LINKEDIN_TEXT_LIMIT} from '../shared/linkedin-preview.ts';
 import {canonical,contactOrSensitive,findMatches,preferenceOf,positiveInterests,eligibleMatches,normalizeInstagram,normalizeLinkedIn,preferenceQuestions} from '../shared/matching.ts';
 import {parseLinkedInText,mergeSourceInterests,sourceSummary,youtubeCandidates} from './source-ingestion.mjs';
+import {getLinkedInImport,LinkedInImportError,pollLinkedInImport,saveLinkedInImport,startLinkedInImport} from './linkedin-import.mjs';
 import {extractYouTubeInterests} from './youtube-interest-extraction.mjs';
 import {generateSourceTopics} from './interest-topic-generation.mjs';
 import {loadInterestTopics,normalizeInterestRecords,interestTopicStatements,assertInterestTopicCapacity} from './interest-topics.mjs';
 const json=(data,status=200)=>Response.json(data,{status,headers:{'Access-Control-Allow-Origin':'*','Cache-Control':'no-store'}});
 const fail=(error,status=400)=>json({error},status);
+const profileColumns=['id','name','bio','interests','color','created','instagram_handle','instagram_visible','linkedin_handle','linkedin_visible','avatar'];
+const profileSnapshot=p=>profileColumns.map(column=>p[column]??'');
+const profileGuard=profileColumns.map(column=>column+' IS ?').join(' AND ');
+const profileVersion=p=>createHash('sha256').update(JSON.stringify(profileSnapshot(p))).digest('hex');
 function storedInterests(value){let parsed=[];try{parsed=JSON.parse(value||'[]')}catch{}return Array.isArray(parsed)?parsed.filter(t=>t&&typeof t==='object'&&typeof t.label==='string'&&typeof t.category==='string'):[];}
-function profile(p,own=false,friend=false){const interests=storedInterests(p.interests);return {id:p.id,name:p.name,bio:p.bio,color:p.color,avatar:p.avatar||'',...(isDemoProfile(p)?{isDemo:true}:{}),...(own?{linkedinHandle:p.linkedin_handle||'',linkedinVisible:p.linkedin_visible==='friends'}:friend&&p.linkedin_visible==='friends'&&p.linkedin_handle?{linkedinHandle:p.linkedin_handle}:{}),interests:interests.filter(t=>own||t.shared===true).map(t=>({...t,...(!own?{topicId:undefined}:{}),preference:preferenceOf(t)})),...(own?{instagramHandle:p.instagram_handle||'',instagramVisible:p.instagram_visible==='friends'}:friend&&p.instagram_visible==='friends'&&p.instagram_handle?{instagramHandle:p.instagram_handle}:{})};}
+function profile(p,own=false,friend=false){const interests=storedInterests(p.interests);return {id:p.id,name:p.name,bio:p.bio,color:p.color,avatar:p.avatar||'',...(isDemoProfile(p)?{isDemo:true}:{}),...(own?{version:profileVersion(p),linkedinHandle:p.linkedin_handle||'',linkedinVisible:p.linkedin_visible==='friends'}:friend&&p.linkedin_visible==='friends'&&p.linkedin_handle?{linkedinHandle:p.linkedin_handle}:{}),interests:interests.filter(t=>own||t.shared===true).map(t=>({...t,...(!own?{topicId:undefined}:{}),preference:preferenceOf(t)})),...(own?{instagramHandle:p.instagram_handle||'',instagramVisible:p.instagram_visible==='friends'}:friend&&p.instagram_visible==='friends'&&p.instagram_handle?{instagramHandle:p.instagram_handle}:{})};}
 async function hash(token){const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(token));return [...new Uint8Array(bytes)].map(b=>b.toString(16).padStart(2,'0')).join('');}
 function base64url(bytes){return btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
 function changed(result){return Number(result?.changes??result?.meta?.changes??0);}
@@ -87,6 +93,19 @@ export async function api(req,env){const requestStartedAt=Date.now();try{
  if(!account)return fail('회원가입 또는 로그인해주세요.',401);
  if(!owner)return fail('세션이 만료되었어요. 다시 시작해주세요.',401);
  let p=await db.prepare('SELECT * FROM profiles WHERE owner=?').bind(owner).first();
+ if(b.action==='getLinkedInImport')return json(await getLinkedInImport(db,owner,env));
+ if(b.action==='startLinkedInImport'){
+  if(!p)return fail('먼저 내 취향을 등록해주세요.');
+  try{return json(await startLinkedInImport(db,owner,b.url,env));}catch(error){if(error instanceof LinkedInImportError)return fail(error.message,error.status);throw error;}
+ }
+ if(b.action==='pollLinkedInImport'){
+  if(!p)return fail('먼저 내 취향을 등록해주세요.');
+  try{return json(await pollLinkedInImport(db,owner,b.jobId,env));}catch(error){if(error instanceof LinkedInImportError)return fail(error.message,error.status);throw error;}
+ }
+ if(b.action==='saveLinkedInImport'){
+  if(!p)return fail('먼저 내 취향을 등록해주세요.');
+  try{return json(await saveLinkedInImport(db,owner,b.jobId,b.selectedIds,env,req.signal));}catch(error){if(error instanceof LinkedInImportError)return fail(error.message,error.status);throw error;}
+ }
  if(b.action==='startYouTubeOAuth'){
   if(!p)return fail('먼저 내 취향을 등록해주세요.');if(!env.YOUTUBE_CLIENT_ID||!env.YOUTUBE_CLIENT_SECRET||!env.YOUTUBE_REDIRECT_URI)return fail('YouTube 연결 설정이 아직 완료되지 않았어요. 관리자에게 OAuth 환경 설정을 요청해주세요.',503);
   const state=base64url(crypto.getRandomValues(new Uint8Array(32))),verifier=base64url(crypto.getRandomValues(new Uint8Array(64))),challenge=base64url(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(verifier))));
@@ -138,17 +157,27 @@ export async function api(req,env){const requestStartedAt=Date.now();try{
  }
  if(b.action==='extractYouTubeInterests'){
   if(!p)return fail('먼저 내 취향을 등록해주세요.');
-  if(!Array.isArray(b.channelIds)||b.channelIds.length!==5||new Set(b.channelIds).size!==5||b.channelIds.some(id=>typeof id!=='string'||!id))return fail('YouTube 채널을 정확히 5개 선택해주세요.');
+  if(!Array.isArray(b.channelIds)||b.channelIds.length<1||b.channelIds.length>5||new Set(b.channelIds).size!==b.channelIds.length||b.channelIds.some(id=>typeof id!=='string'||!id))return fail('YouTube 채널을 1~5개 선택해주세요.');
   const source=await db.prepare('SELECT youtube_summary FROM source_syncs WHERE owner=?').bind(owner).first();let summary;try{summary=JSON.parse(source?.youtube_summary||'null');}catch{}const storedChannels=Array.isArray(summary?.channels)?summary.channels:[],byId=new Map(storedChannels.map(channel=>[channel?.id,channel]));
-  if(b.channelIds.some(id=>!byId.has(id)))return fail('연결된 내 YouTube 채널 목록에서 5개를 선택해주세요.');
+  if(b.channelIds.some(id=>!byId.has(id)))return fail('연결된 내 YouTube 채널 목록에서 1~5개를 선택해주세요.');
   const selected=b.channelIds.map(id=>byId.get(id)),initial=storedInterests(p.interests);
   if(initial.length>=100)return fail('관심사는 최대 100개까지 등록할 수 있어요. 기존 관심사를 정리한 뒤 다시 시도해주세요.');
-  const records=selected.map((channel,index)=>({id:channel.id,label:contactOrSensitive(channel.title)?`선택 채널 ${index+1}`:String(channel.title).slice(0,120),evidence:sourceText(channel.description).slice(0,400),url:channel.url}));let normalized,inputLength=0,generated=false;
-  try{normalized=await normalizeSource(db,owner,initial,records,env,async(unmatched,active)=>{
+  const records=selected.map((channel,index)=>({id:channel.id,label:contactOrSensitive(channel.title)?`선택 채널 ${index+1}`:String(channel.title).slice(0,120),evidence:sourceText(channel.description).slice(0,400),url:channel.url}));let normalized,inputLength=0,generated=false,fallback=false;
+  try{normalized=await withDeadline(active=>normalizeSource(db,owner,initial,records,env,async(unmatched,active)=>{
    generated=true;
    const channels=unmatched.map(record=>({title:record.label,description:record.evidence})),extraction=await extractYouTubeInterests(channels,env,active);inputLength=extraction.inputLength;
    return extraction.interests.map(item=>({...item,refs:item.refs.map(ref=>unmatched[ref-1].id)}));
-  },req.signal,5);}catch(error){return normalizationFailure(error);}
+  },active,5),req.signal,60000);}catch(error){
+   if(req.signal.aborted)throw error;
+   if(error?.code==='TOPIC_CAPACITY')return normalizationFailure(error);
+   if(!['QWEN_NOT_CONFIGURED','QWEN_FAILED','NOT_CONFIGURED','PROVIDER','INVALID_RESULT','EMPTY_RESULT'].includes(error?.code)&&error?.name!=='TimeoutError')throw error;
+   fallback=true;
+  }
+  if(!normalized?.interests.length){
+   fallback=true;
+   const record=records[0],title=sourceText(record.label).slice(0,50),label=/^선택 채널 \d+$/.test(title)||!title?'선택한 구독 채널 시청':`${title} 채널 시청`,category='콘텐츠',key=category+':'+canonical(label),existing=initial.find(item=>item.category+':'+canonical(item.label)===key),topicId=existing?.topicId||crypto.randomUUID();
+   normalized={interests:[{label,category,topicId,evidence:[record.label,contactOrSensitive(record.evidence)?'':record.evidence].filter(Boolean).join(' · ').slice(0,500),url:record.url}],topics:[{id:topicId,label,category}],stats:{reused:existing?1:0,created:existing?0:1,rejected:0}};
+  }
   req.signal.throwIfAborted();
   try{normalized.topics=await assertInterestTopicCapacity(db,owner,normalized.topics);}catch(error){return normalizationFailure(error);}
   const topicIds=new Map(normalized.topics.map(topic=>[topic.category+':'+canonical(topic.label),topic.id]));normalized.interests=normalized.interests.map(item=>({...item,topicId:topicIds.get(item.category+':'+canonical(item.label))}));
@@ -157,7 +186,7 @@ export async function api(req,env){const requestStartedAt=Date.now();try{
   const newKeys=new Set(normalized.interests.map(item=>item.category+':'+canonical(item.label)).filter(key=>!current.some(item=>item.category+':'+canonical(item.label)===key)));
   if(current.length+newKeys.size>100)return fail('분석된 관심사를 모두 저장하면 100개 제한을 넘어요. 기존 관심사를 정리한 뒤 다시 시도해주세요.');
   let latestSummary;try{latestSummary=JSON.parse(latestSource?.youtube_summary||'null');}catch{}if(!latestSummary||typeof latestSummary!=='object')latestSummary=summary;
-  const now=new Date().toISOString(),nextSummary={...latestSummary,candidateCount:count,inference:{provider:generated?'Gemini + Qwen3':'Qwen3',channelIds:b.channelIds,labels:normalized.interests.map(item=>item.label),inputLength},normalization:{model:'Qwen3-Embedding-0.6B',...normalized.stats}},serialized=JSON.stringify(merged),summaryJson=JSON.stringify(nextSummary);
+  const labels=normalized.interests.map(item=>item.label),now=new Date().toISOString(),nextSummary={...latestSummary,candidateCount:count,inference:{provider:fallback?'선택한 채널 원문':generated?'Gemini + Qwen3':'Qwen3',channelIds:b.channelIds,labels,inputLength,fallback},normalization:{model:fallback?null:'Qwen3-Embedding-0.6B',...normalized.stats}},serialized=JSON.stringify(merged),summaryJson=JSON.stringify(nextSummary);
   req.signal.throwIfAborted();
   const results=await db.batch([
    db.prepare('UPDATE profiles SET interests=? WHERE owner=? AND interests=? AND EXISTS (SELECT 1 FROM source_syncs WHERE owner=? AND youtube_summary=?)').bind(serialized,owner,latestRow.interests,owner,source.youtube_summary),
@@ -165,9 +194,11 @@ export async function api(req,env){const requestStartedAt=Date.now();try{
    ...interestTopicStatements(db,owner,normalized.topics,{serializedInterests:serialized,youtubeSummary:summaryJson}),
   ]);
   if(changed(results[0])!==1)return fail('관심사가 분석 중 변경되었어요. 최신 목록에서 다시 시도해주세요.',409);
-  return json({count,interests:merged,normalization:nextSummary.normalization,summary:normalized.interests.length?`선택한 YouTube 채널 5개를 ${generated?'Gemini와 ':''}Qwen3로 분석·검증해 ${count}개의 새로운 비공개 관심사를 추가했어요.`:'민감정보를 제외한 뒤 원문으로 검증할 수 있는 관심사를 찾지 못했어요. 다른 채널을 선택해보세요.'});
+  return json({count,labels,fallback,interests:merged,normalization:nextSummary.normalization,summary:`${fallback?'선택한 채널 이름에서':`선택한 YouTube 채널 ${selected.length}개를 ${generated?'Gemini와 ':''}Qwen3로 분석해`} ${labels.length}개 키워드를 찾았어요. ${count>0?`${count}개의 새로운 관심사를 비공개로 저장했어요.`:'기존 관심사에 있는 키워드를 확인했어요.'}`});
  }
  if(b.action==='saveProfile'){
+  const conflict=()=>fail('프로필이 다른 곳에서 변경되었어요. 최신 프로필을 확인한 뒤 다시 저장해주세요.',409);
+  if(p?b.version!==profileVersion(p):b.version!=null)return conflict();
   const name=String(b.name||'').trim(),bio=String(b.bio||'').trim();if(!name||name.length>30||bio.length>160)return fail('닉네임 1~30자, 소개 160자 이내로 입력해주세요.');
   const tags=Array.isArray(b.interests)?b.interests:[];if(tags.length>100)return fail('관심사는 100개 이하로 등록해주세요.');
   if(contactOrSensitive(name)||contactOrSensitive(bio)||tags.some(t=>contactOrSensitive(String(t.label))))return fail('연락처·계정 링크·식별번호는 제외해주세요.');
@@ -180,8 +211,12 @@ export async function api(req,env){const requestStartedAt=Date.now();try{
   const linkedinVisible=b.linkedinVisible===undefined?p?.linkedin_visible||'private':b.linkedinVisible===true?'friends':'private';
   const instagramVisible=b.instagramVisible===undefined?p?.instagram_visible||'private':b.instagramVisible===true?'friends':'private';
   let avatar;try{avatar=validateAvatar(b.avatar===undefined?p?.avatar||'':b.avatar);}catch(e){return fail(e.message);}
-  const retainedTopicIds=unique.flatMap(item=>item.topicId?[item.topicId]:[]),pruneTopics=db.prepare('DELETE FROM interest_topics WHERE owner=?'+(retainedTopicIds.length?' AND id NOT IN ('+retainedTopicIds.map(()=>'?').join(',')+')':'')).bind(owner,...retainedTopicIds);
-  const id=p?.id||crypto.randomUUID();await db.batch([db.prepare('INSERT INTO profiles (id,owner,name,bio,interests,color,created,instagram_handle,instagram_visible,linkedin_handle,linkedin_visible,avatar) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(owner) DO UPDATE SET name=excluded.name,bio=excluded.bio,interests=excluded.interests,instagram_handle=excluded.instagram_handle,instagram_visible=excluded.instagram_visible,linkedin_handle=excluded.linkedin_handle,linkedin_visible=excluded.linkedin_visible,avatar=excluded.avatar').bind(id,owner,name,bio,JSON.stringify(unique),p?.color||'#3154F5',new Date().toISOString(),instagramHandle,instagramVisible,linkedinHandle,linkedinVisible,avatar),db.prepare("UPDATE accounts SET signup_instagram='',signup_linkedin='' WHERE owner=?").bind(owner),pruneTopics]);await ensureDefaultDemoData(db,{id});return json({id});
+  const id=p?.id||crypto.randomUUID(),nextProfile={id,name,bio,interests:JSON.stringify(unique),color:p?.color||'#3154F5',created:p?.created||new Date().toISOString(),instagram_handle:instagramHandle,instagram_visible:instagramVisible,linkedin_handle:linkedinHandle,linkedin_visible:linkedinVisible,avatar};
+  const save=p?db.prepare('UPDATE profiles SET name=?,bio=?,interests=?,instagram_handle=?,instagram_visible=?,linkedin_handle=?,linkedin_visible=?,avatar=? WHERE owner=? AND '+profileGuard).bind(name,bio,nextProfile.interests,instagramHandle,instagramVisible,linkedinHandle,linkedinVisible,avatar,owner,...profileSnapshot(p)):db.prepare('INSERT INTO profiles (id,owner,name,bio,interests,color,created,instagram_handle,instagram_visible,linkedin_handle,linkedin_visible,avatar) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(owner) DO NOTHING').bind(id,owner,name,bio,nextProfile.interests,nextProfile.color,nextProfile.created,instagramHandle,instagramVisible,linkedinHandle,linkedinVisible,avatar);
+  const savedGuard='EXISTS (SELECT 1 FROM profiles WHERE owner=? AND '+profileGuard+')',retainedTopicIds=unique.flatMap(item=>item.topicId?[item.topicId]:[]);
+  const results=await db.batch([save,db.prepare("UPDATE accounts SET signup_instagram='',signup_linkedin='' WHERE owner=? AND "+savedGuard).bind(owner,owner,...profileSnapshot(nextProfile)),db.prepare('DELETE FROM interest_topics WHERE owner=? AND '+savedGuard+(retainedTopicIds.length?' AND id NOT IN ('+retainedTopicIds.map(()=>'?').join(',')+')':'')).bind(owner,owner,...profileSnapshot(nextProfile),...retainedTopicIds)]);
+  if(changed(results[0])!==1)return conflict();
+  await ensureDefaultDemoData(db,{id});return json({id,version:profileVersion(nextProfile)});
  }
  if(!p)return fail('먼저 내 취향을 등록해주세요.');
  if(b.action==='optimizeGroups'){
@@ -222,7 +257,7 @@ export async function api(req,env){const requestStartedAt=Date.now();try{
  if(b.action==='requestFriend'){const target=String(b.id);if(target===p.id)return fail('내 프로필은 친구로 추가할 수 없어요.');const other=await db.prepare('SELECT id FROM profiles WHERE id=?').bind(target).first();if(!other)return fail('프로필 코드를 확인해주세요.',404);const f=await db.prepare('SELECT * FROM friendships WHERE (sender=? AND recipient=?) OR (sender=? AND recipient=?)').bind(p.id,target,target,p.id).first();if(f)return json({status:f.status});await db.prepare("INSERT INTO friendships (sender,recipient,status) VALUES (?,?,'pending')").bind(p.id,target).run();return json({status:'pending'});}
  if(b.action==='acceptFriend'){await db.prepare("UPDATE friendships SET status='accepted' WHERE sender=? AND recipient=? AND status='pending'").bind(String(b.id),p.id).run();return json({ok:true});}
  if(b.action==='removeFriend'){await db.prepare('DELETE FROM friendships WHERE (sender=? AND recipient=?) OR (sender=? AND recipient=?)').bind(p.id,String(b.id),String(b.id),p.id).run();return json({ok:true});}
- if(b.action==='deleteProfile'){await db.batch([db.prepare('DELETE FROM rooms WHERE id=? AND owner=?').bind(`demo-room-${p.id}`,p.id),db.prepare('DELETE FROM profiles WHERE id=?').bind(p.id)]);return json({ok:true});}
+ if(b.action==='deleteProfile'){await db.batch([db.prepare('DELETE FROM rooms WHERE id=? AND owner=?').bind(`demo-room-${p.id}`,p.id),db.prepare('DELETE FROM linkedin_import_jobs WHERE owner=?').bind(owner),db.prepare('DELETE FROM profiles WHERE id=?').bind(p.id)]);return json({ok:true});}
  if(b.action==='analyze'){
   let people;if(b.room){const member=await db.prepare('SELECT room FROM members WHERE room=? AND profile=?').bind(String(b.room),p.id).first();if(!member)return fail('모임에 참여한 뒤 확인해주세요.',403);const rows=(await db.prepare('SELECT p.* FROM profiles p JOIN members m ON m.profile=p.id WHERE m.room=?').bind(b.room).all()).results,selected=Array.isArray(b.profileIds)?b.profileIds:Array.isArray(b.selected)?b.selected:null;if(selected&&(!selected.length||selected.length>30||new Set(selected).size!==selected.length||selected.some(id=>typeof id!=='string'||!rows.some(row=>row.id===id))))return fail('모임 참여자 선택을 확인해주세요.',403);people=(selected?rows.filter(row=>selected.includes(row.id)):rows).map(row=>profile(row));if(people.length<2)return fail('두 명 이상을 선택해주세요.');}else if(Array.isArray(b.profileIds)){const requested=b.profileIds;if(!requested.length||requested.length>30||new Set(requested).size!==requested.length||requested.some(id=>typeof id!=='string'))return fail('비교할 친구를 선택해주세요.');const friends=(await db.prepare("SELECT p.* FROM friendships f JOIN profiles p ON p.id=CASE WHEN f.sender=? THEN f.recipient ELSE f.sender END WHERE (f.sender=? OR f.recipient=?) AND f.status='accepted'").bind(p.id,p.id,p.id).all()).results,allowed=new Map(friends.map(row=>[row.id,row]));if(requested.some(id=>id!==p.id&&!allowed.has(id)))return fail('서로 수락한 친구만 함께 분석할 수 있어요.',403);people=requested.map(id=>profile(id===p.id?p:allowed.get(id)));if(people.length<2)return fail('비교할 친구를 선택해주세요.');}else{const other=await db.prepare('SELECT * FROM profiles WHERE id=?').bind(String(b.profile)).first();if(!other||other.id===p.id)return fail('비교할 상대를 선택해주세요.');people=[profile(p),profile(other)];}
   let matches=findMatches(people),engine='taxonomy';

@@ -15,6 +15,17 @@ function cleanCategory(value,optional=false){
  return CATEGORY_SET.has(category)?category:(optional?'':'기타');
 }
 
+export function evidenceContainsLabel(label,evidence){
+ const needle=String(label??'').normalize('NFKC').toLocaleLowerCase('en-US').replace(/\s+/g,' ').trim(),haystack=String(evidence??'').normalize('NFKC').toLocaleLowerCase('en-US').replace(/\s+/g,' ').trim();
+ if(needle.length<2||!haystack)return false;
+ const latinWord=character=>/[a-z0-9_]/.test(character||'');
+ for(let index=haystack.indexOf(needle);index>=0;index=haystack.indexOf(needle,index+1)){
+  if((latinWord(needle[0])&&latinWord(haystack[index-1]))||(latinWord(needle.at(-1))&&latinWord(haystack[index+needle.length])))continue;
+  return true;
+ }
+ return false;
+}
+
 function topicKey(label,category){return `${category}:${canonical(label)}`;}
 function validGeneratedLabel(label,category){const key=canonical(label);return !!key&&key!==canonical(category)&&!BROAD_LABELS.has(key);}
 
@@ -47,13 +58,21 @@ function cosine(left,right){
  return Math.max(-1,Math.min(1,score));
 }
 
-async function embeddings(embedTexts,texts,signal){
- abort(signal);const response=await embedTexts(texts,signal);abort(signal);
- return validateVectors(response,texts.length);
+async function embeddings(embedTexts,texts,signal,dimensions){
+ abort(signal);
+ try{
+  const response=await embedTexts(texts,signal);abort(signal);
+  const vectors=validateVectors(response,texts.length);
+  if(dimensions&&vectors.some(vector=>vector.length!==dimensions))throw new Error('Qwen embedding dimensions do not match');
+  return vectors;
+ }catch(error){
+  abort(signal);
+  const failure=new Error(error instanceof Error?error.message:'Qwen embedding failed',{cause:error});failure.code='QWEN_FAILED';throw failure;
+ }
 }
 
-function sourceEvidence(record){return record.evidence?`${record.label} · ${record.evidence}`:record.label;}
-function sourceEmbeddingText(record){const label=record.category?`${record.category} ${record.label}`:record.label;return record.evidence&&canonical(record.evidence)!==canonical(record.label)?`${label} · ${record.evidence}`:label;}
+function sourceEvidence(record){return record.evidenceOnly?record.evidence:(record.evidence?`${record.label} · ${record.evidence}`:record.label);}
+function sourceEmbeddingText(record){if(record.evidenceOnly)return sourceEvidence(record);const label=record.category?`${record.category} ${record.label}`:record.label;return record.evidence&&canonical(record.evidence)!==canonical(record.label)?`${label} · ${record.evidence}`:label;}
 
 export async function loadInterestTopics(db,owner,currentInterests){
  const safeOwner=String(owner||'');if(!safeOwner)return [];
@@ -115,7 +134,7 @@ export async function normalizeInterestRecords(records,existingTopics,{embedText
  const source=[],sourceIds=new Set();
  for(const row of Array.isArray(records)?records.slice(0,40):[]){
   const id=typeof row?.id==='string'?row.id.trim():'',label=cleanText(row?.label,120),category=cleanCategory(row?.category,true),evidence=cleanText(row?.evidence,500),url=typeof row?.url==='string'&&row.url.length<=500&&/^https:\/\//i.test(row.url)?row.url:undefined;
-  if(!id||id.length>100||sourceIds.has(id)||!label)continue;sourceIds.add(id);source.push({id,label,category,evidence,...(url?{url}:{})});
+  if(!id||id.length>100||sourceIds.has(id)||!label||(row?.evidenceOnly===true&&!evidence))continue;sourceIds.add(id);source.push({id,label,category,evidence,...(row?.evidenceOnly===true?{evidenceOnly:true}:{}),...(url?{url}:{})});
  }
  if(!source.length)return {interests:[],topics:[],stats:{reused:0,created:0,rejected:0}};
  const catalog=[],catalogKeys=new Set(),catalogIds=new Set(),blockedKeys=new Set();
@@ -157,10 +176,10 @@ export async function normalizeInterestRecords(records,existingTopics,{embedText
   candidates.push({label,category,refs});
  }
  if(!candidates.length)return finish();
- const generatedVectors=await embeddings(embedTexts,candidates.map(topic=>`${topic.category} ${topic.label}`),signal),accepted=[];
+ const generatedVectors=await embeddings(embedTexts,candidates.map(topic=>`${topic.category} ${topic.label}`),signal,sourceVectors[0].length),accepted=[];
  for(let index=0;index<candidates.length;index++){
-  const candidate=candidates[index],refs=candidate.refs.filter(id=>{
-   const position=source.findIndex(row=>row.id===id);return position>=0&&cosine(generatedVectors[index],sourceVectors[position])>=MATCH_THRESHOLD;
+ const candidate=candidates[index],refs=candidate.refs.filter(id=>{
+   const position=source.findIndex(row=>row.id===id);if(position<0)return false;const record=source[position];return cosine(generatedVectors[index],sourceVectors[position])>=MATCH_THRESHOLD||(record.evidenceOnly===true&&evidenceContainsLabel(candidate.label,record.evidence));
   });
   if(!refs.length)continue;accepted.push({...candidate,refs,vector:generatedVectors[index]});
  }

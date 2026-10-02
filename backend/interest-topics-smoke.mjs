@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {DatabaseSync} from 'node:sqlite';
-import {assertInterestTopicCapacity,interestTopicStatements,loadInterestTopics,normalizeInterestRecords} from './interest-topics.mjs';
+import {assertInterestTopicCapacity,evidenceContainsLabel,interestTopicStatements,loadInterestTopics,normalizeInterestRecords} from './interest-topics.mjs';
 
 const vectors=new Map([
  ['음악 재즈',[1,0,0]],['음악 재즈 채널 · 구독 채널',[.98,.1,0]],
@@ -11,6 +11,16 @@ const vectors=new Map([
  ['C',[0,1,0]],['D',[0,.99,.01]],['운동 저녁 운동',[0,1,0]],
 ]);
 const embed=async texts=>texts.map(text=>vectors.get(text)||[0,0,1]);
+
+assert.equal(evidenceContainsLabel('Applied Artificial Intelligence','We build APPLIED   ARTIFICIAL INTELLIGENCE products.'),true);
+assert.equal(evidenceContainsLabel('AI','chair systems'),false,'Latin labels require word boundaries');
+assert.equal(evidenceContainsLabel('A','A systems'),false,'one-character labels are not grounded');
+assert.equal(evidenceContainsLabel('Python',''),false);
+
+const literalEvidenceOnly=await normalizeInterestRecords([{id:'literal',label:'Applied Artificial Intelligence',category:'공부·일',evidence:'We build Applied Artificial Intelligence products.',evidenceOnly:true}],[],{embedTexts:async texts=>texts.map(text=>text.startsWith('공부·일')?[0,1]:[1,0]),generateTopics:async()=>[{label:'Applied Artificial Intelligence',category:'공부·일',refs:['literal']}]});
+assert.equal(literalEvidenceOnly.interests[0].label,'Applied Artificial Intelligence','literal evidence-only labels survive low cosine grounding while Qwen still runs');
+const missingEvidenceOnly=await normalizeInterestRecords([{id:'missing',label:'Python',category:'공부·일',evidenceOnly:true}],[],{embedTexts:embed,generateTopics:async()=>[{label:'Python',category:'공부·일',refs:['missing']}]});
+assert.deepEqual(missingEvidenceOnly.interests,[],'evidence-only records require evidence');
 
 let generated=false;
 const reused=await normalizeInterestRecords([{id:'r1',label:'재즈 채널',category:'음악',evidence:'구독 채널'}],[{id:'topic-jazz',label:'재즈',category:'음악'}],{embedTexts:embed,generateTopics:async()=>{generated=true;return [];}});

@@ -19,7 +19,8 @@ const origin = `http://127.0.0.1:${port}`;
 const channels = ['재즈 채널', '여행 채널', '요리 채널', '게임 채널', '개발 채널', '운동 채널'].map((title, index) => ({
   id: `channel-${index + 1}`, title, description: `${title}의 영상과 이야기`, url: `https://www.youtube.com/channel/channel-${index + 1}`,
 }));
-// API fixtures isolate UI selection/retry behavior; source-ingestion-smoke covers real persistence and Gemini.
+const longKeyword = '긴채널이름'.repeat(10) + ' 채널 시청';
+// API fixtures isolate UI selection/retry behavior; youtube-import-smoke covers real persistence and fallback.
 const state = {
   account: {username: 'youtube_user'},
   me: {id: 'me', name: '나의 취향', bio: '', color: '#18181B', interests: []},
@@ -52,31 +53,40 @@ try {
     if (request.method() === 'GET') return route.fulfill({json: state});
     const body = request.postDataJSON();
     assert.equal(body.action, 'extractYouTubeInterests');
-    assert.deepEqual(body.channelIds, channels.slice(0, 5).map(channel => channel.id));
+    assert.deepEqual(body.channelIds, channels.slice(0, extractionCalls < 2 ? 5 : 1).map(channel => channel.id));
     extractionCalls++;
     if (extractionCalls === 1) return route.fulfill({status: 503, json: {error: 'Gemini 요청을 다시 시도해주세요.'}});
-    await new Promise(resolve => {completeExtraction = resolve;});
-    state.me.interests.push({id: 'inferred-jazz', label: '재즈 감상', category: '음악', shared: false, preference: 'like', source: {kind: 'youtube', label: '재즈 채널', detail: '선택한 구독 채널을 바탕으로 Gemini가 추출한 관심사'}});
-    state.sources.youtube.candidateCount = 1;
-    return route.fulfill({json: {count: 1, interests: state.me.interests, summary: '관심사 1개를 비공개로 등록했어요.'}});
+    if (extractionCalls === 2) {
+      await new Promise(resolve => {completeExtraction = resolve;});
+      state.me.interests.push({id: 'inferred-jazz', label: '재즈 감상', category: '음악', shared: false, preference: 'like', source: {kind: 'youtube', label: '재즈 채널', detail: '선택한 구독 채널을 바탕으로 추출한 관심사'}});
+      state.sources.youtube.candidateCount = 1;
+    }
+    if (extractionCalls === 4) {
+      state.me.interests.push({id: 'channel-fallback', label: longKeyword, category: '콘텐츠', shared: false, preference: 'like', source: {kind: 'youtube', label: longKeyword, detail: '선택한 채널 이름'}});
+      return route.fulfill({json: {count: 1, labels: [longKeyword], fallback: true, interests: state.me.interests, summary: '선택한 채널 이름에서 키워드 1개를 비공개로 저장했어요.'}});
+    }
+    return route.fulfill({json: {count: extractionCalls === 2 ? 1 : 0, labels: ['재즈 감상'], fallback: false, interests: state.me.interests, summary: extractionCalls === 2 ? '관심사 1개를 비공개로 등록했어요.' : '기존 관심사에 있는 키워드를 확인했어요.'}});
   });
   await page.goto(origin);
   await page.getByRole('tab', {name: '마이', exact: true}).click();
   await page.getByText('YouTube', {exact: true}).click();
-  const extract = () => page.getByRole('button', {name: '선택한 5개 채널로 관심사 추출', exact: true});
+  const extract = () => page.getByRole('button', {name: '선택한 채널에서 키워드 만들기', exact: true});
   await page.getByText('0/5개 선택', {exact: true}).waitFor();
   assert.equal(state.me.interests.length, 0);
   assert(await extract().isDisabled());
-  for (const channel of channels.slice(0, 4)) await page.getByRole('checkbox', {name: channel.title, exact: true}).click();
-  assert(await extract().isDisabled());
+  await page.getByRole('checkbox', {name: channels[0].title, exact: true}).click();
+  assert(!(await extract().isDisabled()), 'one channel enables keyword creation');
+  for (const channel of channels.slice(1, 4)) await page.getByRole('checkbox', {name: channel.title, exact: true}).click();
+  assert(!(await extract().isDisabled()));
   await page.getByRole('checkbox', {name: channels[4].title, exact: true}).click();
   await page.getByText('5/5개 선택', {exact: true}).waitFor();
   assert.equal(await page.getByRole('checkbox', {checked: true}).count(), 5);
   assert(await page.getByRole('checkbox', {name: channels[5].title, exact: true}).isDisabled());
   assert(!(await extract().isDisabled()));
-  // Deselecting releases the limit and selecting again keeps the five-channel contract.
+  // Deselecting releases the maximum and analysis remains available for four channels.
   await page.getByRole('checkbox', {name: channels[4].title, exact: true}).click();
   assert(!(await page.getByRole('checkbox', {name: channels[5].title, exact: true}).isDisabled()));
+  assert(!(await extract().isDisabled()));
   await page.getByRole('checkbox', {name: channels[4].title, exact: true}).click();
   await mkdir('.data/qa', {recursive: true});
   await page.screenshot({path: '.data/qa/youtube-selection-mobile.png', fullPage: true});
@@ -88,10 +98,11 @@ try {
   assert.equal(state.me.interests.length, 0);
   assert.equal(await page.getByRole('checkbox', {checked: true}).count(), 5);
   await extract().click();
-  await page.getByRole('button', {name: '관심사를 추출하고 있어요…', exact: true}).waitFor();
+  await page.getByRole('button', {name: '키워드를 만들고 있어요…', exact: true}).waitFor();
   assert.equal(await page.getByRole('checkbox', {disabled: true}).count(), 6);
   completeExtraction();
   await page.getByText('관심사 1개를 비공개로 등록했어요.', {exact: true}).waitFor();
+  await page.getByText('#재즈 감상', {exact: true}).waitFor();
   await page.getByText('0/5개 선택', {exact: true}).waitFor();
   assert.equal(extractionCalls, 2);
   await page.getByRole('button', {name: '등록한 관심사와 공유 설정', exact: true}).click();
@@ -99,15 +110,30 @@ try {
   assert.equal(await page.getByRole('switch', {name: '재즈 감상 공유', exact: true}).isChecked(), false);
   assert.equal(state.me.interests.length, 1);
   assert(!state.me.interests.some(interest => channels.some(channel => channel.title === interest.label)));
-  // Reload retains extracted interests; four channels cannot enable another request.
+  // Reload retains extracted interests; one of four available channels can reuse a keyword.
   state.sources.youtube.channels = channels.slice(0, 4);
   await page.reload();
   await page.getByRole('tab', {name: '마이', exact: true}).click();
   await page.getByText('YouTube', {exact: true}).click();
-  await page.getByText('분석하려면 구독 채널이 5개 이상 필요해요. 채널을 구독한 뒤 다시 연결해주세요.', {exact: true}).waitFor();
   assert(await extract().isDisabled());
+  await page.getByRole('checkbox', {name: channels[0].title, exact: true}).click();
+  assert(!(await extract().isDisabled()));
+  await extract().click();
+  await page.getByText('기존 관심사에 있는 키워드를 확인했어요.', {exact: true}).waitFor();
+  await page.getByText('#재즈 감상', {exact: true}).waitFor();
+  assert.equal(extractionCalls, 3);
+  assert.equal(state.me.interests.length, 1);
+  await page.setViewportSize({width: 390, height: 900});
+  await page.getByRole('checkbox', {name: channels[0].title, exact: true}).click();
+  await extract().click();
+  await page.getByText('#' + longKeyword, {exact: true}).waitFor();
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'long fallback keywords fit mobile width');
+  await page.screenshot({path: '.data/qa/youtube-keywords-mobile.png', fullPage: true});
+  await page.setViewportSize({width: 1440, height: 1000});
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+  await page.screenshot({path: '.data/qa/youtube-keywords-desktop.png', fullPage: true});
   assert.deepEqual(pageErrors, []);
-  console.log('PASS: YouTube five-channel selection, no automatic interests, sixth-channel limit, retry preserves selection, loading controls, private inferred interest, mobile/desktop layout, and fewer-than-five guidance');
+  console.log('PASS: YouTube one-to-five-channel selection, sixth-channel limit, visible retry/progress/keyword results, private persistence, existing keyword reuse, and mobile/desktop layout');
 } finally {
   completeExtraction?.();
   await browser?.close();

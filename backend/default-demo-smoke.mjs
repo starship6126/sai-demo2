@@ -26,6 +26,7 @@ const DB={
 const environment={DB,optimizeGroups,fetch:async()=>{throw new Error('default demo smoke must not use the network');}};
 
 async function call({body,token='',query=''}={}){
+ if(body?.action==='saveProfile'&&body.version===undefined&&token)body={...body,version:(await call({token})).data.me?.version??null};
  const response=await api(new Request(`https://test.invalid/api/app${query}`,{
   method:body===undefined?'GET':'POST',
   headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{})},

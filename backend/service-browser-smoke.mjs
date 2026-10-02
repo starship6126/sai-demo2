@@ -127,14 +127,15 @@ try {
   await page.evaluate(() => window.dispatchEvent(new Event('focus')));
   await page.getByText('관심사나 참가자가 바뀌었어요. 다시 비교해주세요.', {exact: true}).waitFor();
   assert.equal(await page.getByText('사용자별 근거', {exact: true}).count(), 0);
-  await call({action: 'saveProfile', ...friendBefore}, friends[0].token);
+  await call({action: 'saveProfile', ...friendBefore, version: (await call(undefined, friends[0].token)).me.version}, friends[0].token);
   await page.evaluate(() => window.dispatchEvent(new Event('focus')));
   console.log('PASS refreshed sharing settings invalidate old comparison evidence');
 
   await page.getByRole('tab', {name: '마이', exact: true}).click();
   await page.getByText('LinkedIn', {exact: true}).click();
+  await page.getByText('프로필 텍스트 직접 입력', {exact: true}).click();
   await page.getByLabel('LinkedIn 가져오기 텍스트').fill('Skills:\nComputer Vision\nDeep Learning\nProjects:\nVisual Recognition');
-  await page.getByText('LinkedIn 관심사 가져오기', {exact: true}).click();
+  await page.getByText('직접 입력한 관심사 가져오기', {exact: true}).click();
   await page.getByText('등록한 데이터', {exact: true}).waitFor();
   const imported = (await call(undefined, token)).me.interests.filter(t => t.source?.kind === 'linkedin');
   assert(imported.length >= 2 && imported.every(t => !t.shared));

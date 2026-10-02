@@ -13,7 +13,7 @@ import {rankInterests, scoreGroup, type GroupPlan} from '../shared/grouping';
 import type {PersonalTopic} from '../shared/interest-profile';
 import type {CommonInterest, DemoPlan} from '../shared/demo-types';
 import {toCommonInterest, toDemoPlan, toDemoProfile, toEvidence} from '../shared/service-presentation';
-import {getServiceState, getSharedProfile, serviceAction, ServiceError, tokenClear, tokenRead, tokenSave, type ServiceState, type SourceState} from './service-api';
+import {getServiceState, getSharedProfile as requestSharedProfile, serviceAction as requestAction, ServiceError, tokenClear, tokenRead, tokenSave, type EditableProfile, type LinkedInImportJob, type ServiceState, type SourceState} from './service-api';
 import {analyzePersonalInterests} from './interest-profile-web';
 import {browserSemantic} from './semantic-web';
 import {browserTaste} from './taste-web';
@@ -23,14 +23,28 @@ import {rankConversationTopics} from '../shared/conversation-topics';
 type Tab = '친구' | '그룹' | '마이';
 type Page = 'friends' | 'friend-add' | 'friend-detail' | 'common' | 'common-detail' | 'groups' | 'room-create' | 'room-join' | 'room' | 'participants' | 'conditions' | 'group-result' | 'table-detail' | 'my' | 'profile-edit' | 'share' | 'youtube' | 'linkedin' | 'my-interests' | 'my-interest-detail' | 'analysis';
 const localDemoEnabled = process.env.EXPO_PUBLIC_LOCAL_DEMO !== '0';
+const linkedInJobPrefix = 'sai-linkedin-import:';
+const linkedInAccountKey = 'sai-linkedin-import-account';
+const youtubeAnalysisTimeoutMs = 150_000;
 const empty: ServiceState = {account: null, me: null, friends: [], requests: [], sent: [], rooms: [], selectedRoom: null};
 const newInterestId = () => Date.now().toString(36) + Math.random().toString(36).slice(2);
-const blankProfile: Profile = {id: '', name: '', bio: '', color: '#18181B', interests: []};
+const blankProfile: EditableProfile = {id: '', name: '', bio: '', color: '#18181B', interests: []};
 const names = (people: Profile[]) => people.slice(0, 3).map(p => p.name).join(' · ') + (people.length > 3 ? ` 외 ${people.length - 3}명` : '');
 const sharedStamp = (people: Profile[]) => JSON.stringify(people.map(p => ({id: p.id, name: p.name, interests: p.interests.filter(t => t.shared).map(t => ({id: t.id, label: t.label, category: t.category, preference: preferenceOf(t), source: t.source})).sort((a, b) => a.id.localeCompare(b.id))})).sort((a, b) => a.id.localeCompare(b.id)));
 function codeFrom(value: string, kind: 'profile' | 'room') {
   const input = value.trim();
   try {return new URL(input).searchParams.get(kind) || input;} catch {return input;}
+}
+function linkedInProfileUrl(value?: string) {
+  const input = value?.trim();
+  if (!input) return '';
+  return /^https?:\/\//i.test(input) ? input : `https://www.linkedin.com/in/${input.replace(/^@/, '')}/`;
+}
+function waitForLinkedInPoll(signal: AbortSignal) {
+  return new Promise<void>(resolve => {
+    const timer = setTimeout(resolve, 3000);
+    signal.addEventListener('abort', () => {clearTimeout(timer); resolve();}, {once: true});
+  });
 }
 function Choice({checked, label, detail, detailLines, onPress, disabled = false}: {checked: boolean; label: string; detail?: string; detailLines?: number; onPress: () => void; disabled?: boolean}) {
   return <Pressable accessibilityRole="checkbox" accessibilityLabel={label} accessibilityState={{checked, disabled}} aria-checked={checked} disabled={disabled} onPress={onPress} style={[s.row, {paddingVertical: 12}, disabled && s.disabled]}><View style={[s.check, checked && s.checkSelected]}>{checked && <Icon name="checkmark" size={15} color="white"/>}</View><View style={s.flex}><Text style={s.label}>{label}</Text>{detail && <Text style={s.small} numberOfLines={detailLines}>{detail}</Text>}</View></Pressable>;
@@ -57,7 +71,9 @@ function AccountApp({onExample}: {onExample: () => void}) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [confirmation, setConfirmation] = useState('');
-  const [draft, setDraft] = useState<Profile>(blankProfile);
+  const [draft, setDraft] = useState<EditableProfile>(blankProfile);
+  const [profileConflict, setProfileConflict] = useState<EditableProfile | null>(null);
+  const [profileConflictDetected, setProfileConflictDetected] = useState(false);
   const [input, setInput] = useState('');
   const [category, setCategory] = useState('음악');
   const [preference, setPreference] = useState<Preference>('like');
@@ -81,7 +97,7 @@ function AccountApp({onExample}: {onExample: () => void}) {
   const [groupBridgeTopics, setGroupBridgeTopics] = useState<Match[]>([]);
   const [commonPeople, setCommonPeople] = useState<Profile[]>([]);
   const [matches, setMatches] = useState<Match[]>([]);
-  const [onlyAll, setOnlyAll] = useState(true);
+  const [onlyAll, setOnlyAll] = useState(false);
   const [filter, setFilter] = useState('전체');
   const [topic, setTopic] = useState<CommonInterest | null>(null);
   const [plans, setPlans] = useState<DemoPlan[]>([]);
@@ -91,15 +107,31 @@ function AccountApp({onExample}: {onExample: () => void}) {
   const [table, setTable] = useState<DemoPlan['groups'][number] | null>(null);
   const [share, setShare] = useState<{title: string; url: string; code: string} | null>(null);
   const [linkedinText, setLinkedinText] = useState('');
+  const [linkedinUrl, setLinkedinUrl] = useState('');
+  const [linkedinJob, setLinkedinJob] = useState<LinkedInImportJob | null>(null);
+  const [linkedinCandidates, setLinkedinCandidates] = useState<Interest[]>([]);
+  const [linkedinSelected, setLinkedinSelected] = useState<string[]>([]);
+  const [linkedinProgress, setLinkedinProgress] = useState('');
+  const [linkedinBusy, setLinkedinBusy] = useState(false);
+  const [linkedinManualOpen, setLinkedinManualOpen] = useState(false);
   const [youtubeChannelIds, setYoutubeChannelIds] = useState<string[]>([]);
   const [youtubeAnalyzing, setYoutubeAnalyzing] = useState(false);
+  const [youtubeFeedback, setYoutubeFeedback] = useState<{kind: 'progress' | 'success' | 'error'; message: string; labels: string[]} | null>(null);
   const [personal, setPersonal] = useState<PersonalTopic[]>([]);
   const [ownTopic, setOwnTopic] = useState<PersonalTopic | null>(null);
   const [progress, setProgress] = useState('');
   const [returnPage, setReturnPage] = useState<Page>('my');
   const [deleteConfirm, setDeleteConfirm] = useState(false);
   const operation = useRef<AbortController | null>(null);
+  const linkedinOperation = useRef<AbortController | null>(null);
+  const youtubeOperation = useRef<AbortController | null>(null);
+  const linkedinBusyRef = useRef(false);
+  const linkedinStartRef = useRef(false);
+  const linkedinAccountRef = useRef('');
   const lifecycle = useRef<AbortController | null>(null);
+  const accountLifecycle = useRef<AbortController | null>(null);
+  const accountGeneration = useRef(0);
+  const accountIdentity = useRef('');
   const mounted = useRef(true);
   const loadVersion = useRef(0);
   const scroll = useRef<ScrollView | null>(null);
@@ -113,17 +145,125 @@ function AccountApp({onExample}: {onExample: () => void}) {
   const selectedPeople = (room?.members || []).filter(p => participantIds.includes(p.id));
   const shownMatches = rankInterests(matches, commonPeople).filter(m => (filter === '전체' || m.category === filter) && (!onlyAll || commonPeople.every(p => m.members.includes(p.id))));
 
-  async function load(auth = session.current, selectedRoom = roomRef.current, signal = lifecycle.current?.signal) {
+  function serviceAction<T>(auth: string, action: string, body: Record<string, unknown> = {}, signal = accountLifecycle.current?.signal) {
+    return requestAction<T>(auth, action, body, signal);
+  }
+  function getSharedProfile(auth: string, id: string, signal = accountLifecycle.current?.signal) {
+    return requestSharedProfile(auth, id, signal);
+  }
+
+  function linkedInStorageKey(account = data.account?.username) {return account ? `${linkedInJobPrefix}${account}` : '';}
+  function rememberLinkedInJob(job: LinkedInImportJob) {
+    if (Platform.OS !== 'web') return;
+    const key = linkedInStorageKey();
+    if (key) globalThis.localStorage?.setItem(key, JSON.stringify({jobId: job.jobId, url: job.url, startedAt: Date.now()}));
+  }
+  function forgetLinkedInJob(account = data.account?.username) {
+    if (Platform.OS !== 'web' || !account) return;
+    globalThis.localStorage?.removeItem(`${linkedInJobPrefix}${account}`);
+  }
+  function resetAccountState() {
+    accountGeneration.current += 1; loadVersion.current += 1;
+    operation.current?.abort(); operation.current = null;
+    linkedinOperation.current?.abort(); linkedinOperation.current = null;
+    youtubeOperation.current?.abort(); youtubeOperation.current = null;
+    accountLifecycle.current?.abort(); accountLifecycle.current = new AbortController();
+    busyRef.current = false; linkedinBusyRef.current = false; linkedinStartRef.current = false;
+    setBusy(false); setError(''); setNotice(''); setData(empty); setDraft(blankProfile); setProfileConflict(null); setProfileConflictDetected(false);
+    setTab('친구'); setPage('friends'); setUsername(''); setPassword(''); setConfirmation('');
+    setInput(''); setCategory('음악'); setPreference('like'); setQuickText(''); setCandidates([]); setSearch('');
+    setFriendIds([]); setIncludeMe(true); setCode(''); setPreview(null); setRemoveConfirm(false);
+    roomRef.current = undefined; setRoomId(undefined); setRoomName(''); setParticipantIds([]); setTableSize(4); setUseAI(false); setUseBridge(true);
+    setBridgeStatus(''); setBridgeMessage(''); setGroupBridgeTopics([]); setCommonPeople([]); setMatches([]); setOnlyAll(false); setFilter('전체'); setTopic(null);
+    setPlans([]); setPlanIndex(0); setGroupPeople([]); setSavedPlan(false); setTable(null); setShare(null);
+    setLinkedinText(''); setLinkedinUrl(''); setLinkedinJob(null); setLinkedinCandidates([]); setLinkedinSelected([]); setLinkedinProgress(''); setLinkedinBusy(false); setLinkedinManualOpen(false);
+    setYoutubeChannelIds([]); setYoutubeAnalyzing(false); setYoutubeFeedback(null); setPersonal([]); setOwnTopic(null); setProgress(''); setReturnPage('my'); setDeleteConfirm(false);
+    personalInput.current = undefined; linkedinAccountRef.current = '';
+  }
+  async function expireSession() {
+    resetAccountState(); accountIdentity.current = ''; session.current = ''; setToken('');
+    await tokenClear(); setNotice('세션이 만료되었어요. 다시 로그인해주세요.');
+  }
+  async function pollLinkedInJob(job: LinkedInImportJob, suppliedController?: AbortController) {
+    if (linkedinBusyRef.current) return;
+    const generation = accountGeneration.current, auth = session.current;
+    const controller = suppliedController || new AbortController();
+    linkedinOperation.current = controller; linkedinBusyRef.current = true; setLinkedinBusy(true); setError('');
+    try {
+      for (let attempt = 0; attempt < 200 && !controller.signal.aborted; attempt++) {
+        const result = await serviceAction<LinkedInImportJob>(token, 'pollLinkedInImport', {jobId: job.jobId}, controller.signal);
+        if (controller.signal.aborted || generation !== accountGeneration.current || auth !== session.current) return;
+        setLinkedinJob(result);
+        if (result.status === 'ready') {
+          const rows = (result.candidates || []).slice(0, 5).map(item => ({...item, preference: 'explore' as const, shared: false}));
+          setLinkedinCandidates(rows); setLinkedinSelected(rows.map(item => item.id));
+          setLinkedinProgress(`${rows.length}개의 관심사 후보를 찾았어요. 근거를 확인하고 저장할 항목을 골라주세요.`);
+          rememberLinkedInJob(result); return;
+        }
+        if (result.status === 'failed') {forgetLinkedInJob(); throw new Error(result.error || 'LinkedIn 프로필을 가져오지 못했어요. 다시 시도해주세요.');}
+        setLinkedinProgress(attempt > 19 ? '프로필을 계속 확인하고 있어요. 화면을 나가도 나중에 진행 상태를 다시 확인할 수 있어요.' : '프로필을 가져와 관심사 후보를 만들고 있어요. 잠시만 기다려주세요.');
+        rememberLinkedInJob(result);
+        await waitForLinkedInPoll(controller.signal);
+      }
+      if (!controller.signal.aborted && generation === accountGeneration.current && auth === session.current) setLinkedinProgress('처리가 계속 진행 중이에요. 아래 버튼으로 진행 상태를 다시 확인해주세요.');
+    } catch (e) {
+      if (!controller.signal.aborted && mounted.current && generation === accountGeneration.current && auth === session.current) setError(e instanceof Error ? e.message : 'LinkedIn 프로필을 확인하지 못했어요.');
+    } finally {
+      if (generation === accountGeneration.current && auth === session.current) {
+        if (linkedinOperation.current === controller) linkedinOperation.current = null;
+        linkedinBusyRef.current = false;
+        if (mounted.current) setLinkedinBusy(false);
+      }
+    }
+  }
+  async function startLinkedInImport() {
+    if (linkedinStartRef.current || linkedinBusyRef.current || !linkedinUrl.trim()) return;
+    const generation = accountGeneration.current, auth = session.current;
+    linkedinStartRef.current = true;
+    const controller = new AbortController(); linkedinOperation.current?.abort(); linkedinOperation.current = controller;
+    setLinkedinBusy(true); setError(''); setLinkedinCandidates([]); setLinkedinSelected([]);
+    setLinkedinProgress('LinkedIn 프로필 가져오기를 시작하고 있어요.');
+    try {
+      const job = await serviceAction<LinkedInImportJob>(token, 'startLinkedInImport', {url: linkedinUrl.trim()}, controller.signal);
+      if (controller.signal.aborted || generation !== accountGeneration.current || auth !== session.current) return;
+      setLinkedinJob(job); setLinkedinUrl(job.url); rememberLinkedInJob(job);
+      setLinkedinBusy(false);
+      await pollLinkedInJob(job, controller);
+    } catch (e) {
+      if (!controller.signal.aborted && mounted.current && generation === accountGeneration.current && auth === session.current) setError(e instanceof Error ? e.message : 'LinkedIn 프로필 가져오기를 시작하지 못했어요.');
+      if (generation === accountGeneration.current && auth === session.current) {
+        if (linkedinOperation.current === controller) linkedinOperation.current = null;
+        if (mounted.current) setLinkedinBusy(false);
+      }
+    } finally {if (generation === accountGeneration.current && auth === session.current) linkedinStartRef.current = false;}
+  }
+  async function saveLinkedInCandidates() {
+    if (!linkedinJob || linkedinJob.status !== 'ready' || !linkedinSelected.length) return;
+    await run(async () => {
+      const generation = accountGeneration.current, auth = session.current;
+      const result = await serviceAction<{count: number; summary: string; interests: Interest[]}>(token, 'saveLinkedInImport', {jobId: linkedinJob.jobId, selectedIds: linkedinSelected}, accountLifecycle.current?.signal);
+      if (generation !== accountGeneration.current || auth !== session.current) return;
+      await load();
+      if (generation !== accountGeneration.current || auth !== session.current) return;
+      setLinkedinCandidates([]); setLinkedinSelected([]); setLinkedinJob(null); setLinkedinProgress(''); forgetLinkedInJob();
+      setNotice(result.summary || `${result.count}개의 관심사를 비공개로 저장했어요.`);
+    });
+  }
+
+  async function load(auth = session.current, selectedRoom = roomRef.current, signal = accountLifecycle.current?.signal) {
     const version = ++loadVersion.current;
     const next = await getServiceState(auth, selectedRoom, signal);
     if (!mounted.current || signal?.aborted || auth !== session.current || version !== loadVersion.current) return next;
+    const nextIdentity = next.account?.username || '';
+    if (nextIdentity && accountIdentity.current && nextIdentity !== accountIdentity.current) resetAccountState();
+    if (nextIdentity) accountIdentity.current = nextIdentity;
     setData(next);
-    if (auth && !next.account) {await tokenClear(); session.current = ''; setToken(''); setNotice('세션이 만료되었어요. 다시 로그인해주세요.');}
+    if (auth && !next.account) await expireSession();
     return next;
   }
   function editProfile(profile = data.me) {
     setDraft(profile ? {...profile, interests: profile.interests.map(t => ({...t}))} : {...blankProfile, instagramHandle: data.account?.instagramHandle || '', linkedinHandle: data.account?.linkedinHandle || ''});
-    setInput(''); setQuickText(''); setCandidates([]); setDeleteConfirm(false); navigate('profile-edit', '마이');
+    setProfileConflict(null); setProfileConflictDetected(false); setInput(''); setQuickText(''); setCandidates([]); setDeleteConfirm(false); navigate('profile-edit', '마이');
   }
   function readInvite(url: string) {
     try {
@@ -134,7 +274,7 @@ function AccountApp({onExample}: {onExample: () => void}) {
   }
   useEffect(() => {
     mounted.current = true;
-    const controller = new AbortController(); lifecycle.current = controller;
+    const controller = new AbortController(); lifecycle.current = controller; accountLifecycle.current = new AbortController();
     Linking.getInitialURL().then(url => {if (url) readInvite(url);}).catch(() => {});
     const subscription = Linking.addEventListener('url', event => {readInvite(event.url); if (mounted.current) setNotice('초대 링크를 받았어요.');});
     if (Platform.OS === 'web') readInvite(window.location.href);
@@ -143,8 +283,56 @@ function AccountApp({onExample}: {onExample: () => void}) {
       .finally(() => {if (!controller.signal.aborted) setBooting(false);});
     const focus = () => {if (session.current && !busyRef.current) load().catch(() => {});};
     if (Platform.OS === 'web') window.addEventListener('focus', focus);
-    return () => {mounted.current = false; controller.abort(); operation.current?.abort(); subscription.remove(); if (Platform.OS === 'web') window.removeEventListener('focus', focus);};
+    return () => {mounted.current = false; controller.abort(); accountLifecycle.current?.abort(); operation.current?.abort(); linkedinOperation.current?.abort(); youtubeOperation.current?.abort(); subscription.remove(); if (Platform.OS === 'web') window.removeEventListener('focus', focus);};
   }, []);
+  useEffect(() => {
+    const account = data.account?.username;
+    if (!account || linkedinAccountRef.current === account) return;
+    linkedinOperation.current?.abort();
+    if (Platform.OS === 'web') {
+      globalThis.localStorage?.setItem(linkedInAccountKey, account);
+    }
+    linkedinAccountRef.current = account;
+    setLinkedinJob(null); setLinkedinCandidates([]); setLinkedinSelected([]); setLinkedinProgress(''); setLinkedinManualOpen(false);
+    let restored = false;
+    if (Platform.OS === 'web') {
+      const key = `${linkedInJobPrefix}${account}`;
+      try {
+        const saved = JSON.parse(globalThis.localStorage?.getItem(key) || 'null') as {jobId?: string; url?: string; startedAt?: number} | null;
+        if (saved?.jobId && saved.url && saved.startedAt && Date.now() - saved.startedAt < 24 * 60 * 60 * 1000) {
+          setLinkedinJob({jobId: saved.jobId, url: saved.url, status: 'pending'}); setLinkedinUrl(saved.url);
+          setLinkedinProgress('이전에 시작한 프로필 가져오기의 진행 상태를 확인할 수 있어요.'); restored = true;
+        } else if (saved) globalThis.localStorage?.removeItem(key);
+      } catch {globalThis.localStorage?.removeItem(key);}
+    }
+    if (!restored) setLinkedinUrl(linkedInProfileUrl(data.me?.linkedinHandle || data.account?.linkedinHandle));
+  }, [data.account?.username]);
+  useEffect(() => {
+    const account = data.account?.username;
+    if (Platform.OS === 'web' || page !== 'linkedin' || !account || !token || linkedinJob || linkedinStartRef.current) return;
+    const controller = new AbortController();
+    linkedinOperation.current = controller;
+    setLinkedinBusy(true);
+    serviceAction<{job: LinkedInImportJob | null}>(token, 'getLinkedInImport', {}, controller.signal)
+      .then(({job}) => {
+        if (!job || controller.signal.aborted || !mounted.current || linkedinAccountRef.current !== account) return;
+        setLinkedinJob(job); setLinkedinUrl(job.url);
+        if (job.status === 'ready') {
+          const rows = (job.candidates || []).slice(0, 5).map(item => ({...item, preference: 'explore' as const, shared: false}));
+          setLinkedinCandidates(rows); setLinkedinSelected(rows.map(item => item.id));
+          setLinkedinProgress(`${rows.length}개의 관심사 후보를 복원했어요. 저장할 항목을 골라주세요.`);
+        } else setLinkedinProgress('이전에 시작한 프로필 가져오기의 진행 상태를 확인하고 있어요.');
+      })
+      .catch(e => {if (!controller.signal.aborted && mounted.current) setError(e instanceof Error ? e.message : 'LinkedIn 진행 상태를 복원하지 못했어요.');})
+      .finally(() => {
+        if (linkedinOperation.current === controller) linkedinOperation.current = null;
+        if (mounted.current && linkedinAccountRef.current === account) setLinkedinBusy(false);
+      });
+    return () => {controller.abort();};
+  }, [page, data.account?.username, token, linkedinJob?.jobId]);
+  useEffect(() => {
+    if (page === 'linkedin' && linkedinJob?.status === 'pending' && token && !linkedinBusyRef.current) void pollLinkedInJob(linkedinJob);
+  }, [page, linkedinJob?.jobId, token]);
   useEffect(() => {
     if (!data.account || !data.me) return;
     const invite = pendingInvite.current;
@@ -182,6 +370,12 @@ function AccountApp({onExample}: {onExample: () => void}) {
 
   function navigate(next: Page, nextTab?: Tab) {
     operation.current?.abort(); operation.current = null;
+    if (page === 'linkedin' && next !== 'linkedin') linkedinOperation.current?.abort();
+    if (page === 'youtube' && next !== 'youtube') {
+      const activeYoutubeOperation = youtubeOperation.current;
+      youtubeOperation.current = null; activeYoutubeOperation?.abort(); setYoutubeAnalyzing(false);
+      setYoutubeFeedback(current => current?.kind === 'progress' ? null : current);
+    }
     if (nextTab) setTab(nextTab);
     setError(''); setPage(next);
   }
@@ -192,22 +386,22 @@ function AccountApp({onExample}: {onExample: () => void}) {
   }
   async function run(action: () => Promise<void>) {
     if (busyRef.current) return;
+    const generation = accountGeneration.current;
     busyRef.current = true; setBusy(true); setError('');
     const activeSignal = operation.current?.signal;
     try {await action();} catch (e) {
-      if (mounted.current && !activeSignal?.aborted) {
+      if (mounted.current && generation === accountGeneration.current && !activeSignal?.aborted) {
         if (e instanceof ServiceError && e.status === 401 && session.current) {
-          await tokenClear(); session.current = ''; setToken(''); setData(empty);
-          setNotice('세션이 만료되었어요. 다시 로그인해주세요.');
+          await expireSession();
         } else setError(e instanceof Error ? e.message : '요청을 처리하지 못했어요.');
       }
     }
-    finally {busyRef.current = false; if (mounted.current) setBusy(false);}
+    finally {if (generation === accountGeneration.current) {busyRef.current = false; if (mounted.current) setBusy(false);}}
   }
   async function authenticate() {
     await run(async () => {
       const result = await serviceAction<{token: string}>('', authMode, {username: username.trim(), password, ...(authMode === 'register' ? {confirmPassword: confirmation} : {})}, lifecycle.current?.signal);
-      await tokenSave(result.token); session.current = result.token; setToken(result.token);
+      resetAccountState(); await tokenSave(result.token); session.current = result.token; setToken(result.token);
       const next = await load(result.token, undefined);
       setPassword(''); setConfirmation('');
       if (!next.me) {setDraft({...blankProfile, instagramHandle: next.account?.instagramHandle || '', linkedinHandle: next.account?.linkedinHandle || ''}); navigate('profile-edit', '마이');}
@@ -216,22 +410,69 @@ function AccountApp({onExample}: {onExample: () => void}) {
   }
   async function logout() {
     await run(async () => {
-      await serviceAction(token, 'logout', {}, lifecycle.current?.signal);
-      await tokenClear(); session.current = ''; setToken(''); setData(empty); setDraft(blankProfile); setPersonal([]); setMatches([]); setPlans([]);
-      roomRef.current = undefined; setRoomId(undefined); setFriendIds([]); setYoutubeChannelIds([]); setCode(''); setPreview(null); setPassword(''); setConfirmation(''); navigate('friends', '친구');
+      try {await serviceAction(token, 'logout', {}, accountLifecycle.current?.signal);} catch {}
+      resetAccountState(); accountIdentity.current = ''; session.current = ''; setToken(''); await tokenClear();
     });
   }
   async function saveProfile() {
-    await run(async () => {await serviceAction(token, 'saveProfile', {...draft}, lifecycle.current?.signal); await load(); navigate('my', '마이'); setNotice('프로필을 저장했어요.');});
+    await run(async () => {
+      const generation = accountGeneration.current, auth = session.current;
+      try {
+        await serviceAction<{id: string; version: string}>(token, 'saveProfile', {...draft, version: draft.version ?? null}, accountLifecycle.current?.signal);
+      } catch (e) {
+        if (!(e instanceof ServiceError) || e.status !== 409) throw e;
+        if (generation !== accountGeneration.current || auth !== session.current) return;
+        const latest = await load();
+        if (generation !== accountGeneration.current || auth !== session.current) return;
+        setProfileConflict(latest.me); setProfileConflictDetected(true);
+        setError('다른 곳에서 프로필이 변경됐어요. 현재 편집 내용은 그대로 두었습니다. 최신 프로필을 불러오면 현재 편집 내용이 교체됩니다.');
+        return;
+      }
+      if (generation !== accountGeneration.current || auth !== session.current) return;
+      setProfileConflict(null); setProfileConflictDetected(false); await load();
+      if (generation !== accountGeneration.current || auth !== session.current) return;
+      navigate('my', '마이'); setNotice('프로필을 저장했어요.');
+    });
   }
   async function extractYouTubeInterests() {
-    await run(async () => {
-      setYoutubeAnalyzing(true);
+    if (youtubeOperation.current || youtubeAnalyzing || youtubeChannelIds.length < 1 || youtubeChannelIds.length > 5) return;
+    const generation = accountGeneration.current, auth = session.current, selectedChannelIds = [...youtubeChannelIds];
+    const controller = new AbortController(), accountSignal = accountLifecycle.current?.signal;
+    let timedOut = false;
+    const abortForAccount = () => controller.abort();
+    accountSignal?.addEventListener('abort', abortForAccount, {once: true});
+    const timeout = setTimeout(() => {timedOut = true; controller.abort();}, youtubeAnalysisTimeoutMs);
+    youtubeOperation.current = controller; setYoutubeAnalyzing(true); setError('');
+    setYoutubeFeedback({kind: 'progress', message: '선택한 채널에서 키워드를 만들고 있어요. 최대 1분 정도 걸릴 수 있어요.', labels: []});
+    try {
+      const result = await serviceAction<{count: number; summary: string; labels?: string[]; interests?: Interest[]; fallback?: boolean}>(auth, 'extractYouTubeInterests', {channelIds: selectedChannelIds}, controller.signal);
+      if (!mounted.current || accountSignal?.aborted || controller.signal.aborted || generation !== accountGeneration.current || auth !== session.current) return;
+      const returnedLabels = Array.isArray(result.labels) ? result.labels : result.interests?.filter(item => item.source?.kind === 'youtube').map(item => item.label) || [];
+      const labels = [...new Set(returnedLabels.map(label => label.trim()).filter(Boolean))];
+      if (!labels.length) throw new Error('키워드를 만들지 못했어요. 채널을 다시 선택해 분석해주세요.');
       try {
-        const result = await serviceAction<{count: number; summary: string}>(token, 'extractYouTubeInterests', {channelIds: youtubeChannelIds}, lifecycle.current?.signal);
-        await load(); setYoutubeChannelIds([]); setNotice(result.summary);
-      } finally {if (mounted.current) setYoutubeAnalyzing(false);}
-    });
+        await load(auth, roomRef.current, controller.signal);
+      } catch (refreshError) {
+        if (!mounted.current || accountSignal?.aborted || generation !== accountGeneration.current || auth !== session.current || (controller.signal.aborted && !timedOut)) return;
+        if (refreshError instanceof ServiceError && refreshError.status === 401 && session.current) {await expireSession(); return;}
+        setYoutubeChannelIds([]);
+        setYoutubeFeedback({kind: 'success', message: `${result.summary || `${labels.length}개의 키워드를 저장했어요.`} 최신 프로필을 다시 불러오지 못했어요. 새로고침해서 확인해주세요.`, labels});
+        return;
+      }
+      if (!mounted.current || accountSignal?.aborted || controller.signal.aborted || generation !== accountGeneration.current || auth !== session.current) return;
+      setYoutubeChannelIds([]);
+      setYoutubeFeedback({kind: 'success', message: result.summary || `${labels.length}개의 키워드를 확인했어요.`, labels});
+    } catch (e) {
+      if (!mounted.current || accountSignal?.aborted || generation !== accountGeneration.current || auth !== session.current || (!timedOut && controller.signal.aborted)) return;
+      if (e instanceof ServiceError && e.status === 401 && session.current) await expireSession();
+      else setYoutubeFeedback({kind: 'error', message: timedOut ? '분석 시간이 길어져 중단했어요. 선택한 채널을 유지했으니 다시 시도해주세요.' : e instanceof Error ? e.message : '채널 분석을 완료하지 못했어요. 다시 시도해주세요.', labels: []});
+    } finally {
+      clearTimeout(timeout); accountSignal?.removeEventListener('abort', abortForAccount);
+      if (youtubeOperation.current === controller) {
+        youtubeOperation.current = null;
+        if (mounted.current && generation === accountGeneration.current && auth === session.current) setYoutubeAnalyzing(false);
+      }
+    }
   }
   function addInterest(interest: Interest) {
     if (draft.interests.length >= 100) {setError('관심사는 최대 100개까지 등록할 수 있어요.'); return;}
@@ -241,11 +482,13 @@ function AccountApp({onExample}: {onExample: () => void}) {
   function patchInterest(id: string, patch: Partial<Interest>) {setDraft({...draft, interests: draft.interests.map(t => t.id === id ? {...t, ...patch} : t)});}
   async function editAvatar() {
     await run(async () => {
-      if (Platform.OS === 'web') {const avatar = await chooseAvatar(); if (avatar) setDraft({...draft, avatar}); return;}
+      const generation = accountGeneration.current, auth = session.current;
+      if (Platform.OS === 'web') {const avatar = await chooseAvatar(); if (avatar && generation === accountGeneration.current && auth === session.current) setDraft({...draft, avatar}); return;}
       const permission = await ImagePicker.requestMediaLibraryPermissionsAsync(); if (!permission.granted) throw new Error('사진 접근 권한이 필요해요.');
+      if (generation !== accountGeneration.current || auth !== session.current) return;
       const result = await ImagePicker.launchImageLibraryAsync({mediaTypes: ['images'], allowsEditing: true, aspect: [1, 1], quality: .8}); if (result.canceled) return;
       const photo = await manipulateAsync(result.assets[0].uri, [{resize: {width: 256, height: 256}}], {compress: .75, format: SaveFormat.JPEG, base64: true});
-      if (photo.base64) setDraft({...draft, avatar: `data:image/jpeg;base64,${photo.base64}`});
+      if (photo.base64 && generation === accountGeneration.current && auth === session.current) setDraft({...draft, avatar: `data:image/jpeg;base64,${photo.base64}`});
     });
   }
   async function extract(kind: 'taste' | 'linkedin') {
@@ -267,7 +510,7 @@ function AccountApp({onExample}: {onExample: () => void}) {
   }
   async function createOrJoinRoom(join: boolean) {
     await run(async () => {
-      const result = await serviceAction<{id: string}>(token, join ? 'joinRoom' : 'createRoom', join ? {id: codeFrom(code, 'room')} : {name: roomName.trim()}, lifecycle.current?.signal);
+      const result = await serviceAction<{id: string}>(token, join ? 'joinRoom' : 'createRoom', join ? {id: codeFrom(code, 'room')} : {name: roomName.trim()}, accountLifecycle.current?.signal);
       const next = await load(token, result.id); if (!next.selectedRoom) throw new Error('모임을 불러오지 못했어요.');
       roomRef.current = result.id; setRoomId(result.id); setRoomName(''); navigate('room', '그룹'); setNotice(join ? '모임에 참여했어요.' : '모임을 만들었어요. 초대 링크로 참가자를 모아보세요.');
     });
@@ -282,7 +525,7 @@ function AccountApp({onExample}: {onExample: () => void}) {
   async function analyzeCommon(people = chosenFriends, discoverBridge = useBridge) {
     const controller = new AbortController(); operation.current?.abort(); operation.current = controller;
     const publicPeople = people.map(p => ({...p, interests: p.interests.filter(t => t.shared)}));
-    const origin = page === 'common' ? returnPage : page; setReturnPage(origin); setCommonPeople(publicPeople); setMatches([]); setBridgeStatus(''); setBridgeMessage(''); setOnlyAll(true); setFilter('전체'); setProgress('공유한 관심사의 공통점을 비교하고 있어요'); setPage('analysis');
+    const origin = page === 'common' ? returnPage : page; setReturnPage(origin); setCommonPeople(publicPeople); setMatches([]); setBridgeStatus(''); setBridgeMessage(''); setOnlyAll(false); setFilter('전체'); setProgress('공유한 관심사의 공통점을 비교하고 있어요'); setPage('analysis');
     try {
       let result = findMatches(publicPeople), analyzedPeople = publicPeople;
       if (discoverBridge) {
@@ -313,7 +556,7 @@ function AccountApp({onExample}: {onExample: () => void}) {
   }
   async function confirmPlan() {
     if (!activePlan || !roomId) return;
-    await run(async () => {await serviceAction(token, 'saveRoomPlan', {room: roomId, plan: {size: tableSize, selected: participantIds, groups: activePlan.groups.map(g => g.memberIds), unassigned: activePlan.unassigned || [], ...(groupBridgeTopics.length ? {bridgeTopics: groupBridgeTopics.filter(topic => activePlan.groups.some(group => rankInterests([topic],groupPeople.filter(person => group.memberIds.includes(person.id))).length > 0))} : {})}}, lifecycle.current?.signal); await load(); navigate('room', '그룹'); setNotice('편성을 확정했어요. 모든 참가자가 모임에서 확인할 수 있어요.');});
+    await run(async () => {await serviceAction(token, 'saveRoomPlan', {room: roomId, plan: {size: tableSize, selected: participantIds, groups: activePlan.groups.map(g => g.memberIds), unassigned: activePlan.unassigned || [], ...(groupBridgeTopics.length ? {bridgeTopics: groupBridgeTopics.filter(topic => activePlan.groups.some(group => rankInterests([topic],groupPeople.filter(person => group.memberIds.includes(person.id))).length > 0))} : {})}}, accountLifecycle.current?.signal); await load(); navigate('room', '그룹'); setNotice('편성을 확정했어요. 모든 참가자가 모임에서 확인할 수 있어요.');});
   }
   function openConfirmed() {
     if (!room?.plan) return;
@@ -370,7 +613,7 @@ function AccountApp({onExample}: {onExample: () => void}) {
       <Section title="관심사 추가"><ScrollView horizontal showsHorizontalScrollIndicator={false}><View style={s.tags}>{categories.filter(c => c !== '전체').map(c => <Pressable key={c} accessibilityRole="radio" accessibilityState={{checked: category === c}} onPress={() => setCategory(c)} style={[s.tag, category === c && {backgroundColor: '#18181B'}]}><Text style={[s.tagText, category === c && {color: 'white'}]}>{c}</Text></Pressable>)}</View></ScrollView><View style={s.sizeOptions}>{(['like', 'avoid', 'explore'] as Preference[]).map(p => <Pressable key={p} accessibilityRole="radio" accessibilityState={{checked: preference === p}} onPress={() => setPreference(p)} style={[s.button, s.buttonSecondary, s.flex, preference === p && {backgroundColor: '#18181B'}]}><Text style={[s.link, preference === p && {color: 'white'}]}>{preferenceNames[p]}</Text></Pressable>)}</View><TextInput accessibilityLabel="새 관심사" style={s.input} value={input} onChangeText={setInput} placeholder="예: 재즈, 머신러닝, 러닝" maxLength={60}/><Button secondary disabled={!input.trim() || busy} onPress={() => addInterest({id: newInterestId(), label: input.trim(), category, shared: false, preference})}>관심사 추가</Button></Section>
       <Section title={`등록한 관심사 · ${draft.interests.length}개`}><Text style={s.small}>공유한 항목과 출처 근거는 공개 프로필과 모임에서 볼 수 있어요. 공유하지 않은 항목은 나만 볼 수 있어요.</Text>{draft.interests.map(t => <Card key={t.id}><View style={s.between}><View style={s.flex}><Text style={s.label}>{t.label}</Text><Text style={s.small}>{t.category} · {t.source?.label || '직접 등록'}</Text></View><Pressable accessibilityRole="button" accessibilityLabel={`${t.label} 삭제`} onPress={() => setDraft({...draft, interests: draft.interests.filter(x => x.id !== t.id)})}><Icon name="close" size={19}/></Pressable></View><View style={[s.tags, {marginTop: 12}]}>{(['like', 'avoid', 'explore'] as Preference[]).map(p => <Pressable key={p} accessibilityRole="radio" accessibilityLabel={`${t.label} ${preferenceNames[p]}`} accessibilityState={{checked: preferenceOf(t) === p}} onPress={() => patchInterest(t.id, {preference: p})} style={[s.tag, preferenceOf(t) === p && {backgroundColor: '#18181B'}]}><Text style={[s.tagText, preferenceOf(t) === p && {color: 'white'}]}>{preferenceNames[p]}</Text></Pressable>)}</View>{shareToggle(`${t.label} 공유`, t.shared, shared => patchInterest(t.id, {shared}))}</Card>)}</Section>
       <Section title="문장으로 취향 정리"><Text style={s.description}>{preferenceQuestions[preference]} 직접 쓴 문장에서 후보를 확인하고 원하는 항목만 추가해요.</Text><TextInput accessibilityLabel="취향 정리 문장" style={[s.input, {minHeight: 100, textAlignVertical: 'top'}]} multiline value={quickText} onChangeText={setQuickText} maxLength={20000} placeholder="좋아하는 것 또는 Skills: React, SQL 같은 목록을 입력해주세요"/><Button secondary disabled={busy || !quickText.trim() || quickText.length > 1000} onPress={() => extract('taste')}>AI로 후보 정리</Button><Text style={s.small}>AI 문장 정리는 1,000자까지 지원해요. 웹 첫 실행은 약 614MB 모델 다운로드가 필요해요.</Text><Button secondary disabled={busy || !quickText.trim()} onPress={() => extract('linkedin')}>LinkedIn 목록 미리보기</Button>{busy && !!progress && <Text accessibilityLiveRegion="polite" style={s.small}>{progress}</Text>}{busy && operation.current && <Button secondary onPress={() => {operation.current?.abort(); setProgress('');}}>후보 정리 중단</Button>}{candidates.map(t => <View key={t.id} style={s.between}><View style={s.flex}><Text style={s.label}>{t.label}</Text><Text style={s.small}>{t.category} · {preferenceNames[preferenceOf(t)]}</Text></View><Button compact secondary disabled={draft.interests.some(x => x.category === t.category && canonical(x.label) === canonical(t.label))} onPress={() => addInterest(t)}>추가</Button></View>)}</Section>
-      <Section title="선택 프로필 링크"><TextInput accessibilityLabel="Instagram 아이디" style={s.input} value={draft.instagramHandle || ''} onChangeText={instagramHandle => setDraft({...draft, instagramHandle})} placeholder="Instagram 아이디 또는 링크" autoCapitalize="none"/>{shareToggle('Instagram 친구 공개', !!draft.instagramVisible, instagramVisible => setDraft({...draft, instagramVisible}), '서로 수락한 친구만 볼 수 있어요.')}<TextInput accessibilityLabel="LinkedIn 프로필 아이디" style={s.input} value={draft.linkedinHandle || ''} onChangeText={linkedinHandle => setDraft({...draft, linkedinHandle})} placeholder="LinkedIn 프로필 아이디 또는 링크" autoCapitalize="none"/>{shareToggle('LinkedIn 친구 공개', !!draft.linkedinVisible, linkedinVisible => setDraft({...draft, linkedinVisible}), '계정 로그인과 별개로 프로필 링크를 등록해요.')}</Section><Button disabled={busy || !draft.name.trim()} onPress={saveProfile}>내 취향 저장</Button></>;
+      <Section title="선택 프로필 링크"><TextInput accessibilityLabel="Instagram 아이디" style={s.input} value={draft.instagramHandle || ''} onChangeText={instagramHandle => setDraft({...draft, instagramHandle})} placeholder="Instagram 아이디 또는 링크" autoCapitalize="none"/>{shareToggle('Instagram 친구 공개', !!draft.instagramVisible, instagramVisible => setDraft({...draft, instagramVisible}), '서로 수락한 친구만 볼 수 있어요.')}<TextInput accessibilityLabel="LinkedIn 프로필 아이디" style={s.input} value={draft.linkedinHandle || ''} onChangeText={linkedinHandle => setDraft({...draft, linkedinHandle})} placeholder="LinkedIn 프로필 아이디 또는 링크" autoCapitalize="none"/>{shareToggle('LinkedIn 친구 공개', !!draft.linkedinVisible, linkedinVisible => setDraft({...draft, linkedinVisible}), '계정 로그인과 별개로 프로필 링크를 등록해요.')}</Section>{profileConflictDetected && <Card quiet><Text style={s.label}>최신 프로필과 편집 내용이 달라요</Text><Text style={s.description}>현재 편집 내용은 유지되어 있어요. 최신 프로필을 불러오면 지금 입력한 내용이 교체됩니다.</Text><Button secondary disabled={busy} onPress={() => {const latest = profileConflict || {...blankProfile, instagramHandle: data.account?.instagramHandle || '', linkedinHandle: data.account?.linkedinHandle || ''}; setDraft({...latest, interests: latest.interests.map(item => ({...item}))}); setProfileConflict(null); setProfileConflictDetected(false); setError(''); setCandidates([]); setInput(''); setQuickText('');}}>최신 프로필 불러오기</Button></Card>}<Button disabled={busy || !draft.name.trim()} onPress={saveProfile}>내 취향 저장</Button></>;
   }
 
   function renderPage() {
@@ -392,13 +635,13 @@ function AccountApp({onExample}: {onExample: () => void}) {
       case 'analysis': return <View style={s.analysis}><Text style={s.eyebrow}>INTEREST ANALYSIS</Text><View style={s.analysisGraphic}><Icon name="sparkles-outline" size={38}/><ActivityIndicator style={s.analysisSpinner} color="#18181B"/></View><Text style={[s.title, {textAlign: 'center'}]}>함께할 이야기를 찾고 있어요</Text><Text accessibilityLiveRegion="polite" style={[s.description, {textAlign: 'center'}]}>{progress}</Text><Text style={[s.small, {textAlign: 'center'}]}>실제 데이터와 모델로 분석해요. 처음에는 모델 준비에 시간이 걸릴 수 있어요.</Text><Button secondary onPress={back}>분석 중단</Button></View>;
       case 'group-result': return activePlan && <><Heading eyebrow={savedPlan ? 'CONFIRMED GROUP' : 'RECOMMENDED PLANS'} title={savedPlan ? '확정한 편성이에요' : '이 조합은 어때요?'} description={`${names(groupPeople)}\n${groupPeople.length}명의 테이블과 추천 근거를 확인해보세요.`}/>{!savedPlan && <View style={s.planOptions}>{plans.map((plan, i) => <Pressable key={plan.id} accessibilityRole="tab" accessibilityLabel={`추천 ${i + 1}`} accessibilityState={{selected: i === planIndex}} onPress={() => setPlanIndex(i)} style={[s.planOption, i === planIndex && s.planOptionActive]}><Text style={[s.planCaption, i === planIndex && {color: 'white'}]}>추천 {i + 1}</Text><Text style={[s.planScore, i === planIndex && {color: 'white'}]}>{Math.round(plan.score)}<Text style={s.planUnit}> 점</Text></Text></Pressable>)}</View>}<Card quiet><Text style={s.label}>{activePlan.label}</Text><View style={[s.metrics, {marginTop: 20}]}><Metric label="전체 추천 점수" value={Math.round(activePlan.score)} suffix="점"/><Metric label="최저 테이블" value={Math.round(activePlan.minGroupScore)} suffix="점"/><Metric label="테이블 간 균형" value={Math.round(activePlan.balance)} suffix="점"/></View></Card><Text style={s.small}>{savedPlan ? '확정한 배정을 표시해요. 점수와 근거는 현재 공유 관심사로 다시 계산했어요.' : `${plans.length}개의 서로 다른 편성안을 찾았어요. 실제 CP-SAT 상태와 후보 범위는 아래에 표시해요.`}</Text>{!savedPlan && <Text style={s.small}>OR-Tools CP-SAT · {activePlan.solverStatus} · {activePlan.candidateScope === 'bounded' ? '제한한 후보 범위' : '전체 후보 범위'} ({activePlan.candidateCount || 0}개)</Text>}{!!activePlan.unassigned?.length && <Card quiet><Text style={s.label}>배정 보류 · {activePlan.unassigned.length}명</Text><Text style={s.description}>{names(groupPeople.filter(p => activePlan.unassigned!.includes(p.id)))}</Text></Card>}<Section title={`${activePlan.groups.length}개의 테이블`}>{activePlan.groups.map((g, i) => <Pressable key={g.id} accessibilityRole="button" accessibilityLabel={`테이블 ${i + 1} 상세 보기`} onPress={() => {setTable(g); navigate('table-detail');}} style={s.card}><View style={s.between}><Text style={s.tableTitle}>테이블 {i + 1}</Text><Score value={g.score}/></View><View style={[s.row, {marginTop: 16}]}>{g.memberIds.map(id => {const p = groupPeople.find(p => p.id === id); return p ? <Avatar key={id} profile={toDemoProfile(p)} size={33}/> : null;})}</View><Text style={[s.description, {marginTop: 10}]}>{names(groupPeople.filter(p => g.memberIds.includes(p.id)))}</Text><View style={[s.tags, {marginTop: 16}]}>{g.interests.map(t => <Tag key={t.id}>#{t.label}</Tag>)}</View><Text style={[s.link, {marginTop: 12}]}>테이블 상세 보기</Text></Pressable>)}</Section>{!savedPlan && !canConfirm && <Text style={s.description}>모임을 만든 사람이 편성을 확정할 수 있어요.</Text>}</>;
       case 'table-detail': return table && <><Heading eyebrow="TABLE DETAILS" title={`테이블 ${activePlan?.groups.findIndex(g => g.id === table.id)! + 1}`} description={names(groupPeople.filter(p => table.memberIds.includes(p.id)))}/><View style={s.avatarStack}>{groupPeople.filter(p => table.memberIds.includes(p.id)).map(p => <View key={p.id} style={s.stackPerson}><Avatar profile={toDemoProfile(p)} size={48}/><Text style={s.stackName}>{p.name}</Text></View>)}</View><Card quiet><View style={s.between}><Text style={s.label}>그룹 점수</Text><Score value={table.score} large/></View><QualityRow label="주제 강도" score={table.quality.topicStrength}/><QualityRow label="구성원 균형" score={table.quality.memberBalance}/><QualityRow label="주제 다양성" score={table.quality.topicBreadth}/><QualityRow label="쌍 연결도" score={table.quality.pairCoverage}/></Card><Section title="함께 이야기할 주제 Top 3">{table.interests.length ? table.interests.map(t => <Card key={t.id}><View style={s.between}><Text style={s.sectionTitle}>{t.label}</Text><Score value={t.score}/></View><Text style={s.small}>{t.members.length}/{table.memberIds.length}명 연결 · {topicTypeLabel(t)}</Text><Text style={[s.description, {marginVertical: 14}]}>{t.reason}</Text>{evidenceCards(t, groupPeople)}</Card>) : <Text style={s.description}>근거가 있는 공통 주제가 없어요. 편성은 배정 조건을 충족하지만 관심사 연결 점수는 낮을 수 있어요.</Text>}</Section></>;
-      case 'my': return <><Heading eyebrow="UNDERSTAND YOUR INTERESTS" title="나를 알아가는 사이" description="나의 관심사를 담고, 공유할 이야기와 원문 근거를 직접 정해요."/><View style={s.profile}><Avatar profile={toDemoProfile(data.me)} size={68}/><View style={s.flex}><Text style={s.profileName}>{data.me.name}</Text><Text style={s.description}>{data.me.bio || `@${data.account.username}`}</Text><Text style={s.small}>{data.me.interests.filter(t => t.shared).length}개 공유 · {data.me.interests.filter(t => !t.shared).length}개 비공개</Text></View><Pressable accessibilityRole="button" accessibilityLabel="프로필 수정" onPress={() => editProfile()} style={s.profileEdit}><Icon name="pencil-outline"/></Pressable></View><Button secondary onPress={() => startShare('profile')}>프로필 링크 / QR 공유</Button><Section title="관심사 데이터 연결"><Pressable accessibilityRole="button" onPress={() => navigate('youtube')} style={s.integrationCard}><View style={s.integrationIcon}><Icon name="logo-youtube" size={25}/></View><View style={s.flex}><Text style={s.label}>YouTube</Text><Text style={s.small}>재생목록 · 영상 · 구독 채널</Text></View><Tag>{sourceStatus(data.sources?.youtube)}</Tag><Icon name="chevron-forward" size={17}/></Pressable><Pressable accessibilityRole="button" onPress={() => navigate('linkedin')} style={s.integrationCard}><View style={s.integrationIcon}><Icon name="logo-linkedin" size={23}/></View><View style={s.flex}><Text style={s.label}>LinkedIn</Text><Text style={s.small}>직접 입력한 프로필 텍스트</Text></View><Tag>{sourceStatus(data.sources?.linkedin)}</Tag><Icon name="chevron-forward" size={17}/></Pressable></Section><Section title="나의 관심사" action="전체 보기" onAction={() => navigate('my-interests')}>{data.me.interests.length ? <Card>{data.me.interests.slice(0, 5).map(t => <View key={t.id} style={s.topicRow}><View style={s.flex}><Text style={s.topicTitle}>{t.label}</Text><Text style={s.small}>{t.category} · {preferenceNames[preferenceOf(t)]}</Text></View><Tag>{t.shared ? '공유' : '비공개'}</Tag></View>)}</Card> : <Empty title="어떤 이야기를 좋아하세요?" text="프로필 수정에서 관심사를 직접 등록하거나 외부 데이터를 가져와보세요."/>}<Button disabled={!data.me.interests.some(t => preferenceOf(t) !== 'avoid') || busy} onPress={analyzePersonal}>내 관심사 AI 분석</Button><Text style={s.small}>나의 비공개 관심사도 분석할 수 있어요. 분석이 공개 설정을 바꾸지는 않아요. 웹 첫 분석은 약 614MB 모델을 내려받아요.</Text></Section>{data.me.instagramHandle && <Button secondary onPress={() => Linking.openURL(`https://www.instagram.com/${data.me!.instagramHandle}/`)}>Instagram 프로필 열기</Button>}{data.me.linkedinHandle && <Button secondary onPress={() => Linking.openURL(`https://www.linkedin.com/in/${data.me!.linkedinHandle}/`)}>LinkedIn 프로필 열기</Button>}<Section title="계정"><Button secondary disabled={busy} onPress={logout}>로그아웃</Button>{localDemoEnabled && <Button secondary disabled={busy} onPress={onExample}>예시 데이터로 체험하기</Button>}<Pressable accessibilityRole="button" onPress={() => setDeleteConfirm(!deleteConfirm)}><Text style={s.small}>프로필 삭제</Text></Pressable>{deleteConfirm && <Card><Text style={s.description}>프로필과 친구 연결, 모임 참여 기록을 삭제해요. 계정은 남아 있으며 새 프로필을 만들 수 있어요.</Text><Button secondary disabled={busy} onPress={() => run(async () => {await serviceAction(token, 'deleteProfile'); roomRef.current = undefined; setRoomId(undefined); await load(); setDraft(blankProfile); setFriendIds([]); navigate('profile-edit'); setNotice('프로필을 삭제했어요.');})}>프로필 삭제 확인</Button></Card>}</Section></>;
+      case 'my': return <><Heading eyebrow="UNDERSTAND YOUR INTERESTS" title="나를 알아가는 사이" description="나의 관심사를 담고, 공유할 이야기와 원문 근거를 직접 정해요."/><View style={s.profile}><Avatar profile={toDemoProfile(data.me)} size={68}/><View style={s.flex}><Text style={s.profileName}>{data.me.name}</Text><Text style={s.description}>{data.me.bio || `@${data.account.username}`}</Text><Text style={s.small}>{data.me.interests.filter(t => t.shared).length}개 공유 · {data.me.interests.filter(t => !t.shared).length}개 비공개</Text></View><Pressable accessibilityRole="button" accessibilityLabel="프로필 수정" onPress={() => editProfile()} style={s.profileEdit}><Icon name="pencil-outline"/></Pressable></View><Button secondary onPress={() => startShare('profile')}>프로필 링크 / QR 공유</Button><Section title="관심사 데이터 연결"><Pressable accessibilityRole="button" onPress={() => navigate('youtube')} style={s.integrationCard}><View style={s.integrationIcon}><Icon name="logo-youtube" size={25}/></View><View style={s.flex}><Text style={s.label}>YouTube</Text><Text style={s.small}>재생목록 · 영상 · 구독 채널</Text></View><Tag>{sourceStatus(data.sources?.youtube)}</Tag><Icon name="chevron-forward" size={17}/></Pressable><Pressable accessibilityRole="button" onPress={() => navigate('linkedin')} style={s.integrationCard}><View style={s.integrationIcon}><Icon name="logo-linkedin" size={23}/></View><View style={s.flex}><Text style={s.label}>LinkedIn</Text><Text style={s.small}>개인 프로필 링크에서 관심사 찾기</Text></View><Tag>{sourceStatus(data.sources?.linkedin)}</Tag><Icon name="chevron-forward" size={17}/></Pressable></Section><Section title="나의 관심사" action="전체 보기" onAction={() => navigate('my-interests')}>{data.me.interests.length ? <Card>{data.me.interests.slice(0, 5).map(t => <View key={t.id} style={s.topicRow}><View style={s.flex}><Text style={s.topicTitle}>{t.label}</Text><Text style={s.small}>{t.category} · {preferenceNames[preferenceOf(t)]}</Text></View><Tag>{t.shared ? '공유' : '비공개'}</Tag></View>)}</Card> : <Empty title="어떤 이야기를 좋아하세요?" text="프로필 수정에서 관심사를 직접 등록하거나 외부 데이터를 가져와보세요."/>}<Button disabled={!data.me.interests.some(t => preferenceOf(t) !== 'avoid') || busy} onPress={analyzePersonal}>내 관심사 AI 분석</Button><Text style={s.small}>나의 비공개 관심사도 분석할 수 있어요. 분석이 공개 설정을 바꾸지는 않아요. 웹 첫 분석은 약 614MB 모델을 내려받아요.</Text></Section>{data.me.instagramHandle && <Button secondary onPress={() => Linking.openURL(`https://www.instagram.com/${data.me!.instagramHandle}/`)}>Instagram 프로필 열기</Button>}{data.me.linkedinHandle && <Button secondary onPress={() => Linking.openURL(`https://www.linkedin.com/in/${data.me!.linkedinHandle}/`)}>LinkedIn 프로필 열기</Button>}<Section title="계정"><Button secondary disabled={busy} onPress={logout}>로그아웃</Button>{localDemoEnabled && <Button secondary disabled={busy} onPress={onExample}>예시 데이터로 체험하기</Button>}<Pressable accessibilityRole="button" onPress={() => setDeleteConfirm(!deleteConfirm)}><Text style={s.small}>프로필 삭제</Text></Pressable>{deleteConfirm && <Card><Text style={s.description}>프로필과 친구 연결, 모임 참여 기록을 삭제해요. 계정은 남아 있으며 새 프로필을 만들 수 있어요.</Text><Button secondary disabled={busy} onPress={() => run(async () => {await serviceAction(token, 'deleteProfile'); roomRef.current = undefined; setRoomId(undefined); await load(); setDraft(blankProfile); setFriendIds([]); navigate('profile-edit'); setNotice('프로필을 삭제했어요.');})}>프로필 삭제 확인</Button></Card>}</Section></>;
       case 'share': return share && <><Heading eyebrow="SHARE A CONNECTION" title={share.title} description="링크 또는 QR을 공유해주세요. 받은 사람은 로그인 후 친구 요청이나 모임 참여를 할 수 있어요."/><Card><View style={{alignItems: 'center', padding: 20}}><QRCode value={share.url} size={210}/></View><Text selectable style={s.small}>{share.url}</Text></Card><Button onPress={() => run(async () => {await Clipboard.setStringAsync(share.url); setNotice('링크를 복사했어요.');})}>링크 복사</Button><Button secondary onPress={() => run(async () => {await Clipboard.setStringAsync(share.code); setNotice('코드를 복사했어요.');})}>코드 복사</Button><Button secondary onPress={() => run(async () => {if (Platform.OS === 'web' && navigator.share) await navigator.share({title: share.title, url: share.url}); else if (Platform.OS !== 'web') await Share.share({message: share.url}); else {await Clipboard.setStringAsync(share.url); setNotice('공유할 링크를 복사했어요.');}})}>공유하기</Button></>;
       case 'youtube': return <>
-        <Heading eyebrow="REAL DATA · YOUTUBE" title={'즐겨 보는 채널에서\n관심사를 찾을 수 있어요'} description="YouTube를 연결하고 나의 취향을 잘 보여주는 구독 채널 5개를 골라주세요."/>
+        <Heading eyebrow="REAL DATA · YOUTUBE" title={'즐겨 보는 채널에서\n관심사를 찾을 수 있어요'} description="YouTube를 연결하고 나의 취향을 잘 보여주는 구독 채널을 1~5개 골라주세요."/>
         <Card>
           <View style={s.between}><Text style={s.sectionTitle}>YouTube</Text><Tag>{sourceStatus(data.sources?.youtube)}</Tag></View>
-          <Text style={[s.description, {marginVertical: 18}]}>연결하면 채널 목록만 불러와요. 선택한 채널을 AI로 분석·정규화한 뒤 원문 근거가 확인된 관심사만 비공개로 등록해요.</Text>
+          <Text style={[s.description, {marginVertical: 18}]}>연결하면 채널 목록만 불러와요. 선택한 채널의 이름과 설명에서 비공개 키워드를 만들고, 구체적인 주제를 찾지 못하면 선택한 채널 이름을 사용해요.</Text>
           <Button disabled={busy} onPress={() => run(async () => {const result = await serviceAction<{authUrl: string}>(token, 'startYouTubeOAuth'); if (Platform.OS === 'web') {window.open(result.authUrl, '_blank', 'noopener,noreferrer'); setNotice('연결 창에서 인증을 완료한 뒤 데이터를 새로고침해주세요.');} else await Linking.openURL(result.authUrl);})}>YouTube 연결</Button>
           <Text style={[s.small, {marginTop: 12}]}>Google 계정의 읽기 전용 권한을 사용해요. 연결을 마치면 돌아와 데이터를 새로고침해주세요.</Text>
         </Card>
@@ -411,18 +654,19 @@ function AccountApp({onExample}: {onExample: () => void}) {
             label={channel.title}
             detail={channel.description}
             detailLines={3}
-            disabled={busy || (youtubeChannelIds.length >= 5 && !youtubeChannelIds.includes(channel.id))}
+            disabled={busy || youtubeAnalyzing || (youtubeChannelIds.length >= 5 && !youtubeChannelIds.includes(channel.id))}
             onPress={() => setYoutubeChannelIds(selected => selected.includes(channel.id) ? selected.filter(id => id !== channel.id) : selected.length < 5 ? [...selected, channel.id] : selected)}
           />)}</Card> : <Empty icon="logo-youtube" title="선택할 구독 채널이 없어요" text="YouTube를 연결해 채널 목록을 불러와주세요. 이전에 연결했다면 다시 연결해주세요."/>}
-          {!!data.sources?.youtube.channels?.length && data.sources.youtube.channels.length < 5 && <Text style={s.description}>분석하려면 구독 채널이 5개 이상 필요해요. 채널을 구독한 뒤 다시 연결해주세요.</Text>}
-          <Text style={s.small}>선택한 5개 채널의 이름과 설명을 분석해 기존 관심사와 먼저 비교하고, 새 주제는 이름을 정리한 뒤 출처와 다시 대조해요. 결과는 프로필에서 확인하고 공유 여부를 정할 수 있어요.</Text>
-          <Button disabled={busy || youtubeChannelIds.length !== 5} onPress={extractYouTubeInterests}>{youtubeAnalyzing ? '분석·정규화하고 있어요…' : '선택한 5개 채널 분석·정규화'}</Button>
-          {youtubeAnalyzing && <View accessibilityLiveRegion="polite" style={s.row}><ActivityIndicator color="#18181B"/><Text style={s.small}>기존 관심사 비교와 원문 근거 확인을 진행하고 있어요.</Text></View>}
+          <Text style={s.small}>선택한 채널의 이름과 설명을 분석해 기존 관심사와 먼저 비교하고, 최소 1개의 키워드를 프로필에 연결해요. 결과는 비공개로 저장되며 공유 여부는 직접 정할 수 있어요.</Text>
+          <Button disabled={busy || youtubeAnalyzing || youtubeChannelIds.length < 1 || youtubeChannelIds.length > 5} onPress={extractYouTubeInterests}>{youtubeAnalyzing ? '키워드를 만들고 있어요…' : '선택한 채널에서 키워드 만들기'}</Button>
+          {youtubeFeedback?.kind === 'progress' && <View accessibilityLiveRegion="polite" style={s.row}><ActivityIndicator color="#18181B"/><Text style={s.small}>{youtubeFeedback.message}</Text></View>}
+          {youtubeFeedback?.kind === 'error' && <View accessibilityRole="alert" style={s.error}><Icon name="alert-circle-outline" color="#A33B34" size={20}/><Text style={s.errorText}>{youtubeFeedback.message}</Text></View>}
+          {youtubeFeedback?.kind === 'success' && <Card quiet><Text accessibilityLiveRegion="polite" style={s.label}>{youtubeFeedback.message}</Text><View style={[s.tags, {marginTop: 12}]}>{youtubeFeedback.labels.map(label => <View key={label} style={[s.tag, {maxWidth: '100%'}]}><Text style={s.tagText}>#{label}</Text></View>)}</View><Button secondary onPress={() => editProfile()}>프로필에서 키워드 확인</Button></Card>}
         </Section>
         <Section title="불러온 데이터">{sourceSummary(data.sources?.youtube)}</Section>
         <Button secondary onPress={() => editProfile()}>등록한 관심사와 공유 설정</Button>
       </>;
-      case 'linkedin': return <><Heading eyebrow="REAL DATA · LINKEDIN" title={'경험과 기술에도\n관심사가 담겨 있어요'} description="직접 내보낸 프로필 텍스트를 AI로 분석·정규화해 관심사를 찾아요."/><Card quiet><Text style={s.description}>Skills, Experience, Education, Projects 또는 한국어 제목을 포함한 텍스트를 붙여넣어주세요. 기존 관심사와 비교하고 원문 근거가 확인된 새 관심사만 비공개로 저장해요.</Text></Card><TextInput accessibilityLabel="LinkedIn 가져오기 텍스트" editable={!busy} style={[s.input, s.textarea]} multiline value={linkedinText} onChangeText={setLinkedinText} maxLength={50000} placeholder={'Skills:\nReact\nSQL\nProjects:\n데이터 시각화'}/><Button disabled={busy || !linkedinText.trim()} onPress={() => run(async () => {const result = await serviceAction<{summary: string}>(token, 'importLinkedInText', {text: linkedinText}); await load(); setNotice(result.summary);})}>{busy ? '분석·정규화하고 있어요…' : 'LinkedIn 텍스트 분석·정규화'}</Button>{busy && <View accessibilityLiveRegion="polite" style={s.row}><ActivityIndicator color="#18181B"/><Text style={s.small}>기존 관심사 비교와 원문 근거 확인을 진행하고 있어요.</Text></View>}<Section title="등록한 데이터">{sourceSummary(data.sources?.linkedin)}</Section><Button secondary onPress={() => editProfile()}>가져온 관심사와 공유 설정</Button><Text style={s.small}>단순 목록은 프로필 수정의 ‘LinkedIn 목록 미리보기’로 원하는 후보만 추가할 수 있어요.</Text></>;
+      case 'linkedin': return <><Heading eyebrow="REAL DATA · LINKEDIN" title={'프로필 링크에서\n관심사를 찾을 수 있어요'} description="내 LinkedIn 개인 프로필을 확인해 관심사 후보 1~5개를 만들어요."/><Card quiet><Text style={s.description}>외부 서비스에서 공개 프로필을 가져오고 AI로 관심사 후보를 만들어요. 후보와 원문 근거를 직접 확인한 뒤 선택한 항목만 비공개로 저장해요.</Text></Card><Section title="LinkedIn 프로필"><TextInput accessibilityLabel="LinkedIn 개인 프로필 링크" editable={!linkedinBusy && !busy} style={s.input} value={linkedinUrl} onChangeText={setLinkedinUrl} autoCapitalize="none" autoCorrect={false} keyboardType="url" placeholder="https://www.linkedin.com/in/username"/><Button disabled={linkedinBusy || busy || !linkedinUrl.trim() || linkedinJob?.status === 'pending'} onPress={startLinkedInImport}>{linkedinBusy ? '관심사를 찾는 중' : '프로필에서 관심사 찾기'}</Button>{!!linkedinProgress && <Text accessibilityLiveRegion="polite" style={s.small}>{linkedinProgress}</Text>}{linkedinJob?.status === 'pending' && !linkedinBusy && <Button secondary disabled={busy} onPress={() => pollLinkedInJob(linkedinJob)}>진행 상태 다시 확인</Button>}{linkedinBusy && <Button secondary onPress={() => {linkedinOperation.current?.abort(); setLinkedinProgress('진행 확인을 멈췄어요. 나중에 다시 확인할 수 있어요.');}}>진행 확인 멈추기</Button>}</Section>{linkedinCandidates.length > 0 && <Section title={`관심사 후보 · ${linkedinCandidates.length}개`}><Text style={s.description}>새 관심사는 ‘해보고 싶어요’로 분류되고 비공개로 저장돼요. 원하지 않는 후보는 선택을 해제해주세요.</Text>{linkedinCandidates.map(item => {const checked = linkedinSelected.includes(item.id); return <Card key={item.id}><Choice checked={checked} label={item.label} detail={`${item.category} · ${preferenceNames.explore}`} onPress={() => setLinkedinSelected(checked ? linkedinSelected.filter(id => id !== item.id) : [...linkedinSelected, item.id])}/><View style={{marginTop: 12}}><Text style={s.small}>프로필 원문 근거</Text><Text style={[s.description, {marginTop: 5}]}>{item.source?.detail || item.source?.label || 'LinkedIn 공개 프로필에서 확인한 내용'}</Text></View></Card>;})}<Button disabled={busy || linkedinBusy || !linkedinSelected.length} onPress={saveLinkedInCandidates}>선택한 관심사 비공개 저장</Button></Section>}<View style={{alignItems: 'center', marginVertical: 8}}><Text style={s.small}>또는</Text></View><Button secondary disabled={busy || linkedinBusy} onPress={() => setLinkedinManualOpen(!linkedinManualOpen)}>{linkedinManualOpen ? '직접 입력 닫기' : '프로필 텍스트 직접 입력'}</Button>{linkedinManualOpen && <Section title="프로필 텍스트 직접 입력"><Text style={s.description}>Skills, Experience, Education, Projects 또는 한국어 제목을 포함한 텍스트를 붙여넣어주세요.</Text><TextInput accessibilityLabel="LinkedIn 가져오기 텍스트" editable={!busy} style={[s.input, s.textarea]} multiline value={linkedinText} onChangeText={setLinkedinText} maxLength={50000} placeholder={'Skills:\nReact\nSQL\nProjects:\n데이터 시각화'}/><Button disabled={busy || !linkedinText.trim()} onPress={() => run(async () => {const result = await serviceAction<{summary: string}>(token, 'importLinkedInText', {text: linkedinText}); await load(); setNotice(result.summary);})}>직접 입력한 관심사 가져오기</Button></Section>}<Section title="등록한 데이터">{sourceSummary(data.sources?.linkedin)}</Section><Button secondary onPress={() => editProfile()}>가져온 관심사와 공유 설정</Button></>;
       case 'my-interests': return <><Heading eyebrow="YOUR INTEREST PROFILE" title="나의 관심사" description={personal.length ? 'AI가 나의 실제 관심사를 묶고 점수와 근거를 정리했어요.' : '직접 등록하거나 가져온 관심사예요. 공유 설정은 프로필 수정에서 바꿀 수 있어요.'}/>{personal.length ? <Card>{personal.map((t, i) => <TopicRow key={t.id} topic={t} index={i} onPress={() => {setOwnTopic(t); navigate('my-interest-detail');}}/>)}</Card> : data.me.interests.length ? data.me.interests.map(t => <Card key={t.id}><View style={s.between}><Text style={s.label}>{t.label}</Text><Tag>{t.shared ? '공유' : '비공개'}</Tag></View><Text style={[s.small, {marginBottom: 12}]}>{t.category} · {preferenceNames[preferenceOf(t)]}</Text><SourceList sources={[toEvidence(t)]}/></Card>) : <Empty title="등록한 관심사가 없어요" text="프로필 수정이나 데이터 연결로 관심사를 추가해주세요."/>}<Button disabled={busy || !data.me.interests.some(t => preferenceOf(t) !== 'avoid')} onPress={analyzePersonal}>내 관심사 AI 분석</Button><Button secondary onPress={() => editProfile()}>관심사와 공유 설정 수정</Button></>;
       case 'my-interest-detail': return ownTopic && <><Heading eyebrow="YOUR INTEREST EVIDENCE" title={ownTopic.label} description="AI가 이 관심사를 발견한 원문 근거예요."/><Card quiet><View style={s.between}><Text style={s.label}>관심사 점수</Text><Score value={ownTopic.score} large/></View><Text style={[s.description, {marginTop: 14}]}>{ownTopic.category} 분야</Text></Card><Section title="관심사의 근거"><Card><SourceList sources={ownTopic.evidence.map(t => toEvidence(t))}/></Card></Section><Text style={s.small}>분석 결과는 나만 확인해요. 관심사 공개 여부는 프로필의 공유 설정을 따릅니다.</Text></>;
     }

@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import {api} from './api.mjs';
 const sql=new DatabaseSync(':memory:');for(const f of fs.readdirSync('drizzle').filter(x=>x.endsWith('.sql')).sort()){if(f.startsWith('0001_'))sql.exec("ALTER TABLE profiles ADD COLUMN instagram_handle TEXT NOT NULL DEFAULT ''; ALTER TABLE profiles ADD COLUMN instagram_visible TEXT NOT NULL DEFAULT 'private';");sql.exec(fs.readFileSync('drizzle/'+f,'utf8'));}
 const DB={prepare(query){const stmt=sql.prepare(query);let args=[];return {bind(...v){args=v;return this;},async first(){return stmt.get(...args)||null;},async all(){return {results:stmt.all(...args)};},async run(){return stmt.run(...args);}};},async batch(stmts){return Promise.all(stmts.map(s=>s.run()));}};
-async function call(body,token='',q=''){const r=await api(new Request('https://test.invalid/api/app'+q,{method:body?'POST':'GET',headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},...(body?{body:JSON.stringify(body)}:{})}),{DB});return {status:r.status,data:await r.json()};}
+async function call(body,token='',q=''){
+ if(body?.action==='saveProfile'&&body.version===undefined&&token)body={...body,version:(await call(undefined,token)).data.me?.version??null};const r=await api(new Request('https://test.invalid/api/app'+q,{method:body?'POST':'GET',headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},...(body?{body:JSON.stringify(body)}:{})}),{DB});return {status:r.status,data:await r.json()};}
 const pass='local-test-password',signup={action:'register',username:'social_signup',password:pass,confirmPassword:pass,instagramHandle:'https://www.instagram.com/Sai_Test/',linkedinHandle:'https://www.linkedin.com/in/sai-test/'};
 assert.equal((await call({...signup,username:'invalid_social',linkedinHandle:'https://evil.invalid/in/test'})).status,400);
 assert.equal(sql.prepare('SELECT username FROM accounts WHERE username=?').get('invalid_social'),undefined);

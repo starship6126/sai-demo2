@@ -24,6 +24,7 @@ for(const file of fs.readdirSync('drizzle').filter(f=>f.endsWith('.sql')).sort()
 }
 const DB={prepare(query){const stmt=sql.prepare(query);let args=[];return {bind(...values){args=values;return this;},async first(){return stmt.get(...args)||null;},async all(){return {results:stmt.all(...args)};},async run(){return stmt.run(...args);}};},async batch(stmts){sql.exec('BEGIN');try{const results=[];for(const stmt of stmts)results.push(await stmt.run());sql.exec('COMMIT');return results;}catch(error){sql.exec('ROLLBACK');throw error;}}};
 async function call(body,token='',q=''){
+ if(body?.action==='saveProfile'&&body.version===undefined&&token)body={...body,version:(await call(undefined,token)).data.me?.version??null};
  const response=await api(new Request('https://test.invalid/api/app'+q,{method:body?'POST':'GET',headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},...(body?{body:JSON.stringify(body)}:{})}),{DB});
  return {status:response.status,data:await response.json()};
 }
